@@ -247,16 +247,21 @@ def main() -> None:
     from gi.repository import Gio, GLib, Gst
 
     Gst.init(None)
-    fd, node, props = Portal(Gio, GLib).start_window_cast()
+    portal = Portal(Gio, GLib)  # keep alive: owns the session D-Bus state
+    fd, node, props = portal.start_window_cast()
     print(f"[probe] PipeWire node {node} props={dict(props)}")
 
-    # vulkancolorconvert asserts on PipeWire's padded BGRx/RGBx formats
-    # (gst-plugins-bad 1.28, swizzle assertion) — convert to RGBA on the CPU
-    # first. The real renderer will sample BGRx directly in a shader.
+    # Normalise to BGRA (KWin already sends BGRA/BGRx; videoconvert is then a
+    # passthrough). vulkansink needs vulkancolorconvert in front of it.
     sink = "fakesink sync=false" if args.no_display else \
-        "videoconvert ! video/x-raw,format=RGBA ! vulkanupload ! vulkansink sync=false"
+        "videoconvert ! video/x-raw,format=BGRA ! vulkanupload ! vulkancolorconvert ! vulkansink sync=false"
+    # Target by object serial: with pipewiresrc >= 1.x, `path=<node id>` may be
+    # ignored and silently fall back to the default source (e.g. the webcam).
+    serial = props.get("pipewire-serial")
+    target = f"target-object={serial}" if serial is not None else f"path={node}"
     pipe = Gst.parse_launch(
-        f"pipewiresrc name=src fd={fd} path={node} do-timestamp=true keepalive-time=0 "
+        f"pipewiresrc name=src fd={fd} {target} do-timestamp=true "
+        f"stream-properties=\"props,node.dont-fallback=(boolean)true,node.dont-reconnect=(boolean)true\" "
         f"! video/x-raw ! queue max-size-buffers=2 leaky=downstream ! {sink}")
 
     cad = Cadence(Gst)
