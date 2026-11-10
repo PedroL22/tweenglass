@@ -250,8 +250,11 @@ def main() -> None:
     fd, node, props = Portal(Gio, GLib).start_window_cast()
     print(f"[probe] PipeWire node {node} props={dict(props)}")
 
+    # vulkancolorconvert asserts on PipeWire's padded BGRx/RGBx formats
+    # (gst-plugins-bad 1.28, swizzle assertion) — convert to RGBA on the CPU
+    # first. The real renderer will sample BGRx directly in a shader.
     sink = "fakesink sync=false" if args.no_display else \
-        "vulkanupload ! vulkancolorconvert ! vulkansink sync=false"
+        "videoconvert ! video/x-raw,format=RGBA ! vulkanupload ! vulkansink sync=false"
     pipe = Gst.parse_launch(
         f"pipewiresrc name=src fd={fd} path={node} do-timestamp=true keepalive-time=0 "
         f"! video/x-raw ! queue max-size-buffers=2 leaky=downstream ! {sink}")
@@ -275,6 +278,15 @@ def main() -> None:
     pipe.set_state(Gst.State.PLAYING)
     print(f"[probe] Measuring for {args.seconds:.0f}s — play the video now.")
     GLib.timeout_add(int(args.seconds * 1000), loop.quit)
+
+    def progress():
+        if cad.t:
+            r = cad.report()
+            print(f"[probe] t+{time.monotonic() - cad.t[0]:.0f}s delivered={r['delivered'].get('fps_avg')} "
+                  f"unique={r['unique_content'].get('fps_avg')} dups={r['duplicate_frames']}", flush=True)
+        return True
+
+    GLib.timeout_add_seconds(5, progress)
     try:
         loop.run()
     except KeyboardInterrupt:
