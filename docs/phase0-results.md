@@ -1,6 +1,6 @@
 # Phase 0 — results
 
-Setup: Lenovo laptop, KDE Plasma 6.8.2 Wayland, Intel RPL-S iGPU + RTX 3050 6GB Laptop (NVIDIA 620.70), lsfg-vk 2.0.0, GStreamer 1.28.8, PipeWire 1.6.10. Panel: 1920×1080 @ 120.21 Hz, scale 1.2.
+Setup: Dell G15 5530 (i5-13450HX), KDE Plasma 6.8.2 Wayland, Intel RPL-S iGPU + RTX 3050 6GB Laptop (NVIDIA 620.70), lsfg-vk 2.0.0, GStreamer 1.28.8, PipeWire 1.6.10. Panel: 1920×1080 @ 120.21 Hz, scale 1.2.
 
 ## 2026-11-10 — Widevine DRM clip (Bitmovin DRM demo, Chrome), renderer on RTX 3050
 
