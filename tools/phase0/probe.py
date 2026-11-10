@@ -185,8 +185,11 @@ class Cadence:
         buf = info.get_buffer()
         now = time.monotonic()
         self.t.append(now)
-        if self.caps is None:
-            self.caps = pad.get_current_caps()
+        caps = pad.get_current_caps()
+        if caps is not None and (self.caps is None or not caps.is_equal(self.caps)):
+            st = caps.get_structure(0)
+            print(f"[probe] source size {st.get_value('width')}x{st.get_value('height')}", flush=True)
+            self.caps = caps
         ok, m = buf.map(Gst.MapFlags.READ)
         if ok:
             data = m.data
@@ -250,6 +253,20 @@ def nvidia_device_name() -> str | None:
     return None
 
 
+def monitor_size() -> tuple[int, int]:
+    """Current mode of the largest enabled output (kscreen-doctor), fallback 1920x1080."""
+    import subprocess
+    try:
+        out = subprocess.run(["kscreen-doctor", "-o"], capture_output=True, text=True, timeout=5).stdout
+        out = re.sub(r"\x1b\[[0-9;]*m", "", out)
+        modes = [(int(w), int(h)) for w, h in re.findall(r"\d+:(\d+)x(\d+)@[\d.]+\*", out)]
+        if modes:
+            return max(modes, key=lambda m: m[0] * m[1])
+    except Exception:
+        pass
+    return (1920, 1080)
+
+
 class MpvSink:
     """Pipe raw BGRA frames into mpv (gpu-next/Vulkan). Only *new* content
     frames are written, so lsfg-vk interpolates between distinct images."""
@@ -291,8 +308,8 @@ class MpvSink:
         if self.proc is None:
             self.size = (w, h)
             self._spawn(w, h)
-        if (w, h) != self.size:
-            return Gst.FlowReturn.OK  # source resized: restart the probe for now
+        if (w, h) != self.size:  # cannot happen with the fixed canvas caps
+            return Gst.FlowReturn.OK
         buf = sample.get_buffer()
         ok, m = buf.map(Gst.MapFlags.READ)
         if not ok:
@@ -362,6 +379,8 @@ def main() -> None:
                     help="mpv: deduped frames piped to a fullscreen, resizable mpv (Vulkan) — default; "
                          "vulkan: GStreamer vulkansink (XWayland, fixed-size); none: measure only")
     ap.add_argument("--no-display", action="store_true", help="alias for --sink none")
+    ap.add_argument("--canvas", type=lambda v: tuple(int(x) for x in v.lower().split("x")), default=None,
+                    help="mpv input size WxH (default: largest active monitor mode)")
     ap.add_argument("--windowed", action="store_true", help="mpv: start windowed instead of fullscreen")
     ap.add_argument("--kwin-fps", action="store_true",
                     help="temporarily load KWin's 'showfps' effect (compositor fps = output fps of the overlay)")
@@ -374,6 +393,8 @@ def main() -> None:
     args = ap.parse_args()
     if args.no_display:
         args.sink = "none"
+    if args.canvas is None:
+        args.canvas = monitor_size()
 
     if args.gpu is not None:
         os.environ["GST_VULKAN_DEVICE"] = str(args.gpu)
@@ -397,7 +418,12 @@ def main() -> None:
     sink = {
         "none": "fakesink sync=false",
         "vulkan": "videoconvert ! video/x-raw,format=BGRA ! vulkanupload ! vulkancolorconvert ! vulkansink sync=false",
-        "mpv": "videoconvert ! video/x-raw,format=BGRA ! appsink name=out emit-signals=true max-buffers=2 drop=true sync=false",
+        # Fixed canvas: the source window changes size (e.g. the browser going
+        # fullscreen 1920x970 -> 1920x1080), but mpv's rawvideo input cannot.
+        # Letterbox every frame into the canvas instead of dropping it.
+        "mpv": ("videoconvert ! videoscale add-borders=true method=bilinear ! "
+                f"video/x-raw,format=BGRA,width={args.canvas[0]},height={args.canvas[1]},pixel-aspect-ratio=1/1 ! "
+                "appsink name=out emit-signals=true max-buffers=2 drop=true sync=false"),
     }[args.sink]
     # Target by object serial: with pipewiresrc >= 1.x, `path=<node id>` may be
     # ignored and silently fall back to the default source (e.g. the webcam).
