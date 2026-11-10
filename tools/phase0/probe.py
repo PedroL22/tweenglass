@@ -277,6 +277,10 @@ class MpvSink:
         self.size = None
         self.last_hash = None
         self.written: list[float] = []
+        import threading
+        self.cv = threading.Condition()
+        self.pending: bytes | None = None
+        self.closed = False
 
     def _spawn(self, w: int, h: int):
         import subprocess
@@ -284,10 +288,15 @@ class MpvSink:
             "mpv", "--no-config", "--really-quiet", "--title=TweenGlass probe",
             "--demuxer=rawvideo", f"--demuxer-rawvideo-w={w}", f"--demuxer-rawvideo-h={h}",
             "--demuxer-rawvideo-mp-format=bgra", "--demuxer-rawvideo-fps=1000",
-            "--untimed", "--cache=no", "--demuxer-readahead-secs=0", "--demuxer-thread=no",
+            # NOTE: keep the demuxer thread ON. With --demuxer-thread=no the
+            # blocking stdin read runs on mpv's main thread, so whenever the
+            # source window is static (no new frames) mpv stops handling input:
+            # "not responding", can't quit, can't toggle fullscreen.
+            "--untimed", "--cache=no", "--demuxer-readahead-secs=0",
             "--vd-queue-enable=no", "--video-latency-hacks=yes",
             "--vo=gpu-next", "--gpu-api=vulkan", "--keepaspect=yes",
             "--osd-level=0", "--input-default-bindings=yes", "--keep-open=yes",
+            f"--input-ipc-server={STATE_DIR / 'probe-mpv.sock'}",
         ]
         if not self.args.windowed:
             cmd.append("--fs")
@@ -296,7 +305,26 @@ class MpvSink:
             cmd.append(f"--vulkan-device={dev}")
         cmd.append("-")
         print(f"[probe] mpv: {' '.join(cmd)}", flush=True)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0)
+        import threading
+        threading.Thread(target=self._writer, daemon=True).start()
+
+    def _writer(self):
+        """Write frames off the GStreamer streaming thread; keep only the newest
+        pending frame so a slow mpv never stalls capture."""
+        while True:
+            with self.cv:
+                while self.pending is None and not self.closed:
+                    self.cv.wait()
+                if self.closed:
+                    return
+                frame, self.pending = self.pending, None
+            try:
+                self.proc.stdin.write(frame)
+                self.written.append(time.monotonic())
+            except (BrokenPipeError, OSError, ValueError):
+                return
 
     def on_sample(self, sink):
         Gst = self.Gst
@@ -322,11 +350,10 @@ class MpvSink:
                 return Gst.FlowReturn.OK  # duplicate: do not present
             self.last_hash = hsh
             if self.proc.poll() is None:
-                try:
-                    self.proc.stdin.write(bytes(data[: w * h * 4]))
-                    self.written.append(time.monotonic())
-                except (BrokenPipeError, OSError):
-                    pass
+                frame = bytes(data[: w * h * 4])
+                with self.cv:
+                    self.pending = frame  # replaces an unwritten older frame
+                    self.cv.notify()
         finally:
             buf.unmap(m)
         return Gst.FlowReturn.OK
@@ -336,6 +363,9 @@ class MpvSink:
         return round(sum(1 for t in self.written if now - t <= window) / window, 1)
 
     def close(self):
+        with self.cv:
+            self.closed = True
+            self.cv.notify()
         if self.proc and self.proc.poll() is None:
             try:
                 self.proc.stdin.close()
