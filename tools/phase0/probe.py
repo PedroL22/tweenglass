@@ -215,6 +215,13 @@ class Cadence:
             "interval_ms_stdev": round(statistics.pstdev(d) * 1000, 2),
         }
 
+    def recent(self, window: float = 5.0) -> tuple[float, float]:
+        """Delivered and unique fps over the last `window` seconds."""
+        now = time.monotonic()
+        d = sum(1 for t in self.t if now - t <= window) / window
+        u = sum(1 for t in self.unique_t if now - t <= window) / window
+        return round(d, 1), round(u, 1)
+
     def report(self) -> dict:
         s = self.caps.get_structure(0) if self.caps else None
         return {
@@ -226,11 +233,138 @@ class Cadence:
 
 
 # --------------------------------------------------------------------------
+# mpv presenter (Vulkan, resizable/fullscreen) fed with de-duplicated frames
+# --------------------------------------------------------------------------
+
+def nvidia_device_name() -> str | None:
+    import subprocess
+    try:
+        out = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return None
+    names = re.findall(r"deviceName\s*=\s*(.+)", out)
+    types = re.findall(r"deviceType\s*=\s*(\S+)", out)
+    for name, kind in zip(names, types):
+        if "DISCRETE" in kind:
+            return name.strip()
+    return None
+
+
+class MpvSink:
+    """Pipe raw BGRA frames into mpv (gpu-next/Vulkan). Only *new* content
+    frames are written, so lsfg-vk interpolates between distinct images."""
+
+    def __init__(self, args, Gst):
+        self.args, self.Gst = args, Gst
+        self.proc = None
+        self.size = None
+        self.last_hash = None
+        self.written: list[float] = []
+
+    def _spawn(self, w: int, h: int):
+        import subprocess
+        cmd = [
+            "mpv", "--no-config", "--really-quiet", "--title=TweenGlass probe",
+            "--demuxer=rawvideo", f"--demuxer-rawvideo-w={w}", f"--demuxer-rawvideo-h={h}",
+            "--demuxer-rawvideo-mp-format=bgra", "--demuxer-rawvideo-fps=1000",
+            "--untimed", "--cache=no", "--demuxer-readahead-secs=0", "--demuxer-thread=no",
+            "--vd-queue-enable=no", "--video-latency-hacks=yes",
+            "--vo=gpu-next", "--gpu-api=vulkan", "--keepaspect=yes",
+            "--osd-level=0", "--input-default-bindings=yes", "--keep-open=yes",
+        ]
+        if not self.args.windowed:
+            cmd.append("--fs")
+        dev = nvidia_device_name() if self.args.gpu != 0 else None
+        if dev and self.args.gpu is not None:
+            cmd.append(f"--vulkan-device={dev}")
+        cmd.append("-")
+        print(f"[probe] mpv: {' '.join(cmd)}", flush=True)
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0)
+
+    def on_sample(self, sink):
+        Gst = self.Gst
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+        s = sample.get_caps().get_structure(0)
+        w, h = s.get_value("width"), s.get_value("height")
+        if self.proc is None:
+            self.size = (w, h)
+            self._spawn(w, h)
+        if (w, h) != self.size:
+            return Gst.FlowReturn.OK  # source resized: restart the probe for now
+        buf = sample.get_buffer()
+        ok, m = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.FlowReturn.OK
+        try:
+            data = m.data
+            step = max(1, len(data) // 65536)
+            hsh = hashlib.blake2b(bytes(data[::step]), digest_size=16).digest()
+            if hsh == self.last_hash:
+                return Gst.FlowReturn.OK  # duplicate: do not present
+            self.last_hash = hsh
+            if self.proc.poll() is None:
+                try:
+                    self.proc.stdin.write(bytes(data[: w * h * 4]))
+                    self.written.append(time.monotonic())
+                except (BrokenPipeError, OSError):
+                    pass
+        finally:
+            buf.unmap(m)
+        return Gst.FlowReturn.OK
+
+    def recent(self, window: float) -> float:
+        now = time.monotonic()
+        return round(sum(1 for t in self.written if now - t <= window) / window, 1)
+
+    def close(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.stdin.close()
+            except OSError:
+                pass
+            self.proc.terminate()
+
+
+class KWinShowFps:
+    """Load KWin's showfps effect for the duration of the probe (restored after)."""
+
+    def __init__(self):
+        import subprocess
+        self.sp = subprocess
+        self.qdbus = "qdbus6" if self._has("qdbus6") else "qdbus"
+        self.was_loaded = "showfps" in self._call("loadedEffects")
+        if not self.was_loaded:
+            self._call("loadEffect", "showfps")
+            print("[probe] KWin showfps effect loaded (compositor fps overlay)", flush=True)
+
+    def _has(self, exe):
+        from shutil import which
+        return which(exe) is not None
+
+    def _call(self, method, *a):
+        r = self.sp.run([self.qdbus, "org.kde.KWin", "/Effects", f"org.kde.kwin.Effects.{method}", *a],
+                        capture_output=True, text=True)
+        return r.stdout
+
+    def close(self):
+        if not self.was_loaded:
+            self._call("unloadEffect", "showfps")
+
+
+# --------------------------------------------------------------------------
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seconds", type=float, default=60, help="measurement time after the stream starts")
-    ap.add_argument("--no-display", action="store_true", help="only measure cadence, no Vulkan sink")
+    ap.add_argument("--sink", choices=["mpv", "vulkan", "none"], default="mpv",
+                    help="mpv: deduped frames piped to a fullscreen, resizable mpv (Vulkan) — default; "
+                         "vulkan: GStreamer vulkansink (XWayland, fixed-size); none: measure only")
+    ap.add_argument("--no-display", action="store_true", help="alias for --sink none")
+    ap.add_argument("--windowed", action="store_true", help="mpv: start windowed instead of fullscreen")
+    ap.add_argument("--kwin-fps", action="store_true",
+                    help="temporarily load KWin's 'showfps' effect (compositor fps = output fps of the overlay)")
     ap.add_argument("--multiplier", type=int, default=2)
     ap.add_argument("--flow-scale", type=float, default=1.0)
     ap.add_argument("--performance", action="store_true")
@@ -238,13 +372,15 @@ def main() -> None:
     ap.add_argument("--gpu", type=int, default=None,
                     help="Vulkan physical device index for vulkansink (see `vulkaninfo --summary`)")
     args = ap.parse_args()
+    if args.no_display:
+        args.sink = "none"
 
     if args.gpu is not None:
         os.environ["GST_VULKAN_DEVICE"] = str(args.gpu)
 
     if args.forget and TOKEN_FILE.exists():
         TOKEN_FILE.unlink()
-    if not args.no_display:
+    if args.sink != "none":
         configure_lsfg(args.multiplier, args.flow_scale, args.performance)
 
     import gi
@@ -258,8 +394,11 @@ def main() -> None:
 
     # Normalise to BGRA (KWin already sends BGRA/BGRx; videoconvert is then a
     # passthrough). vulkansink needs vulkancolorconvert in front of it.
-    sink = "fakesink sync=false" if args.no_display else \
-        "videoconvert ! video/x-raw,format=BGRA ! vulkanupload ! vulkancolorconvert ! vulkansink sync=false"
+    sink = {
+        "none": "fakesink sync=false",
+        "vulkan": "videoconvert ! video/x-raw,format=BGRA ! vulkanupload ! vulkancolorconvert ! vulkansink sync=false",
+        "mpv": "videoconvert ! video/x-raw,format=BGRA ! appsink name=out emit-signals=true max-buffers=2 drop=true sync=false",
+    }[args.sink]
     # Target by object serial: with pipewiresrc >= 1.x, `path=<node id>` may be
     # ignored and silently fall back to the default source (e.g. the webcam).
     serial = props.get("pipewire-serial")
@@ -271,6 +410,11 @@ def main() -> None:
 
     cad = Cadence(Gst)
     pipe.get_by_name("src").get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, cad.probe)
+
+    mpv = MpvSink(args, Gst) if args.sink == "mpv" else None
+    if mpv:
+        pipe.get_by_name("out").connect("new-sample", mpv.on_sample)
+    kwin_fps = KWinShowFps() if args.kwin_fps else None
 
     loop = GLib.MainLoop()
     bus = pipe.get_bus()
@@ -289,11 +433,17 @@ def main() -> None:
     print(f"[probe] Measuring for {args.seconds:.0f}s — play the video now.")
     GLib.timeout_add(int(args.seconds * 1000), loop.quit)
 
+    t0 = time.monotonic()
+
     def progress():
-        if cad.t:
-            r = cad.report()
-            print(f"[probe] t+{time.monotonic() - cad.t[0]:.0f}s delivered={r['delivered'].get('fps_avg')} "
-                  f"unique={r['unique_content'].get('fps_avg')} dups={r['duplicate_frames']}", flush=True)
+        d, u = cad.recent(5.0)
+        extra = f" presented_to_mpv={mpv.recent(5.0)}" if mpv else ""
+        print(f"[probe] t+{time.monotonic() - t0:.0f}s last5s: delivered={d}fps unique={u}fps{extra} "
+              f"dups_total={cad.dups}", flush=True)
+        if mpv and mpv.proc.poll() is not None:
+            print("[probe] mpv closed — stopping", flush=True)
+            loop.quit()
+            return False
         return True
 
     GLib.timeout_add_seconds(5, progress)
@@ -302,6 +452,10 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     pipe.set_state(Gst.State.NULL)
+    if mpv:
+        mpv.close()
+    if kwin_fps:
+        kwin_fps.close()
 
     rep = cad.report()
     print("[probe] RESULT " + json.dumps(rep, indent=2))

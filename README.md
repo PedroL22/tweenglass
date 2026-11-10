@@ -34,7 +34,7 @@ TweenGlass does **not** include lsfg-vk or any Lossless Scaling files. It only d
 Phase 0 probe (validates capture, frame cadence and the lsfg-vk hook):
 
 ```sh
-/usr/bin/python3 tools/phase0/probe.py --seconds 60
+/usr/bin/python3 tools/phase0/probe.py --gpu 1 --kwin-fps --multiplier 4   # fullscreen mpv; q = quit, f = toggle fullscreen
 ```
 
 See [`docs/plan.md`](docs/plan.md) for the roadmap.
