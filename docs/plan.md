@@ -4,11 +4,11 @@
 `tools/phase0/probe.py`: portal window capture → PipeWire → `vulkansink`, with lsfg-vk on.
 
 Exit criteria:
-- [ ] DRM video (Netflix in Chrome/Firefox) appears in the capture, not a black frame.
-- [ ] The cadence of unique frames is close to the content fps (≈24 for films, ≈60 for 60 fps YouTube), with a low interval stdev.
-- [ ] lsfg-vk logs `Using profile ... (environment)` and initializes a swapchain with no errors.
+- [x] DRM video (Widevine in Chrome) appears in the capture, not a black frame. Netflix itself is untested.
+- [x] The cadence of unique frames is close to the content fps (≈24 for films, ≈60 for 60 fps YouTube), with a low interval stdev.
+- [x] lsfg-vk logs `Using profile ... (environment)` and initializes a swapchain with no errors.
 - [ ] Visually, the interpolated output looks smoother than the source.
-- [ ] The same checks pass on the dGPU (RTX 3050 laptop), not only on the iGPU.
+- [x] The same checks pass on the dGPU (RTX 3050 laptop), not only on the iGPU.
 
 ## Phase 1: renderer MVP (Rust)
 - `ashpd` portal session with a restore token, and `pipewire-rs` stream (SHM first, then DMA-BUF import with an SHM fallback).

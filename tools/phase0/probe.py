@@ -235,7 +235,12 @@ def main() -> None:
     ap.add_argument("--flow-scale", type=float, default=1.0)
     ap.add_argument("--performance", action="store_true")
     ap.add_argument("--forget", action="store_true", help="drop the saved portal restore token")
+    ap.add_argument("--gpu", type=int, default=None,
+                    help="Vulkan physical device index for vulkansink (see `vulkaninfo --summary`)")
     args = ap.parse_args()
+
+    if args.gpu is not None:
+        os.environ["GST_VULKAN_DEVICE"] = str(args.gpu)
 
     if args.forget and TOKEN_FILE.exists():
         TOKEN_FILE.unlink()
