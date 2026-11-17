@@ -527,6 +527,46 @@ class MpvSink:
                 pass
 
 
+QT_MODS = {"ctrl": 0x04000000, "control": 0x04000000, "alt": 0x08000000, "shift": 0x02000000,
+           "meta": 0x10000000, "super": 0x10000000}
+
+
+def qt_key_code(keys: str) -> int | None:
+    """'Ctrl+Alt+S' -> Qt key combination int (what kglobalaccel stores)."""
+    *mods, key = keys.split("+")
+    code = 0
+    for m in mods:
+        if m.strip().lower() not in QT_MODS:
+            return None
+        code |= QT_MODS[m.strip().lower()]
+    key = key.strip()
+    if len(key) == 1 and key.isascii() and key.isalnum():
+        return code | ord(key.upper())
+    if re.fullmatch(r"F([1-9]|1[0-9]|2[0-4])", key, re.I):
+        return code | (0x01000030 + int(key[1:]) - 1)
+    return None
+
+
+def shortcut_conflicts(Gio, GLib, bus, keys: str, own_action: str) -> list[str]:
+    """Other kglobalaccel actions bound to the same keys. kglobalaccel lets
+    an app's .desktop X-KDE-Shortcuts (e.g. Crow Translate: Ctrl+Alt+S =
+    speak selection) keep a key that a KWin script also registers, and the
+    other one wins: the shortcut then silently does nothing."""
+    code = qt_key_code(keys)
+    if code is None:
+        return []
+    try:
+        res = bus.call_sync("org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel", "globalShortcutsByKey",
+                            GLib.Variant("((ai)(i))", (([code],), (0,)))  # (QKeySequence, SearchType), None, Gio.DBusCallFlags.NONE, 3000, None)
+    except Exception:
+        return []
+    out = []
+    for action, friendly, comp, comp_friendly, *_ in res.unpack()[0]:
+        if action != own_action:
+            out.append(f"{comp_friendly or comp} — {friendly or action}")
+    return out
+
+
 def altgr_variant(keys: str) -> str | None:
     """Ctrl+Alt+<letter> pressed with the RIGHT Alt on layouts where it is
     AltGr (us-intl, br-abnt2, de, ...) reaches KWin as Ctrl+<AltGr symbol>,
@@ -593,7 +633,7 @@ class Shortcuts:
 
     def __init__(self, Gio, GLib, bus, on_quit, on_toggle, quit_keys: str, toggle_keys: str):
         import subprocess
-        self.sp, self.ok = subprocess, False
+        self.sp, self.ok, self.conflicts = subprocess, False, []
         node = Gio.DBusNodeInfo.new_for_xml(self.XML)
 
         def call(_c, _s, _p, _i, method, params, inv):
@@ -635,6 +675,7 @@ registerShortcut("TweenGlassProbeToggle", "TweenGlass probe: frame generation on
             self.ok = True
             print(f"[probe] {toggle_keys}{' (or ' + alt + ')' if alt else ''} = frame generation on/off "
                   f"for the active window; {quit_keys} = quit", flush=True)
+            self.conflicts = shortcut_conflicts(Gio, GLib, bus, toggle_keys, "TweenGlassProbeToggle")
         else:
             print("[probe] WARNING: could not register KWin shortcuts (KDE Plasma only)", file=sys.stderr)
 
@@ -884,7 +925,12 @@ def main() -> None:
     if args.now or not shortcuts:
         activate()
     else:
-        notify("TweenGlass ready", f"Click the video window and press {args.toggle_keys}")
+        if shortcuts.conflicts:
+            notify(f"TweenGlass: {args.toggle_keys} is taken",
+                   "Also bound to " + "; ".join(shortcuts.conflicts)
+                   + ". Free it in System Settings → Shortcuts, or use --toggle-keys.", urgent=True)
+        else:
+            notify("TweenGlass ready", f"Click the video window and press {args.toggle_keys}")
     if args.seconds:
         GLib.timeout_add(int(args.seconds * 1000), loop.quit)
 
