@@ -18,7 +18,9 @@ Exit criteria:
 - GPU selection: pin to the dGPU on hybrid laptops (lsfg-vk must run on the presenting GPU).
 - JSON-over-stdio control protocol (start/stop/settings/stats).
 
-## Phase 2: UI (Electron + React + shadcn/ui)
+## Phase 2: UI (Electron + React + shadcn/ui) — first version done (2026-11-17)
+Built on the Python backend (`probe.py --ipc`) until the Rust renderer exists: tray, window list with icons (activate = focus the window + forged portal restore token, no dialog), live base/output fps, live settings (lsfg settings restart the presenter on the same window), shortcut recorder with conflict warning, first-run doctor, pt-BR/en. Still open: thumbnails, presets, GlobalShortcuts portal outside KDE.
+
 - Window picker (portal) with a live thumbnail, one large **Activate** button, and a global shortcut (GlobalShortcuts portal).
 - Presets: Film/series, YouTube 60, Game; auto-suggested from measured fps and display Hz.
 - Advanced: multiplier, flow scale, performance mode, GPU, on-screen FPS counter.

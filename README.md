@@ -31,6 +31,25 @@ TweenGlass does **not** include lsfg-vk or any Lossless Scaling files. It only d
 
 ## Development
 
+### App (Electron + React + shadcn/ui)
+
+```sh
+cd app
+bun install
+bun run build
+scripts/install-desktop-entry.sh        # adds "TweenGlass" to the app menu (--autostart: also start in the tray at login)
+```
+
+Open **TweenGlass** from the app menu. It lives in the tray. Closing the window keeps it running, so the shortcut keeps working.
+
+- **Home:** status, live `original → interpolated` fps, and the list of open windows. Press **Activate** on one, or click a window and press `Ctrl+Alt+S`.
+- **Settings:** multiplier (with a recommendation from your refresh rate and the measured fps), flow scale, performance mode, on-screen fps counter, GPU, and shortcut. Changes apply live.
+- **Diagnostics:** lsfg-vk layer, Lossless.dll (any Steam library), dedicated GPU, Plasma/Wayland, gtk4-layer-shell, PipeWire capture, and display mode.
+
+`bun run dev` starts it with hot reload. The UI drives the capture backend (`tools/phase0/probe.py --ipc`) over JSON lines on stdio. The protocol is in `app/src/shared/protocol.ts`. Settings live in `~/.config/TweenGlass/settings.json` and the log in `~/.config/TweenGlass/tweenglass.log`.
+
+### Capture backend / probe (CLI)
+
 Phase 0 probe (validates capture, frame cadence and the lsfg-vk hook):
 
 ```sh
