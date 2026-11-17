@@ -527,6 +527,54 @@ class MpvSink:
                 pass
 
 
+def altgr_variant(keys: str) -> str | None:
+    """Ctrl+Alt+<letter> pressed with the RIGHT Alt on layouts where it is
+    AltGr (us-intl, br-abnt2, de, ...) reaches KWin as Ctrl+<AltGr symbol>,
+    which never matches. Register that symbol too for the current layout."""
+    m = re.fullmatch(r"(?i)ctrl\+alt\+([a-z])", keys.strip())
+    if not m:
+        return None
+    try:
+        import subprocess
+        layout = subprocess.run(["setxkbmap", "-query"], capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return None
+    # AltGr level-3 symbols for the letter S on common layouts; extend as needed.
+    table = {("us", "intl"): {"s": "ß"}, ("us", "altgr-intl"): {"s": "ß"}, ("de", ""): {"s": "ſ"},
+             ("br", ""): {"s": "§"}}
+    lay = (re.search(r"layout:\s*(\S+)", layout) or [None, ""])[1].split(",")[0]
+    var = (re.search(r"variant:\s*(\S+)", layout) or [None, ""])[1].split(",")[0]
+    sym = table.get((lay, var), {}).get(m.group(1).lower())
+    return f"Ctrl+{sym}" if sym else None
+
+
+class Notifier:
+    """Desktop notifications (notify-send), replacing the previous one so
+    toggling quickly doesn't pile them up. The overlay is click-through and
+    keyboard-less, so this is the only feedback that a shortcut was received."""
+
+    def __init__(self):
+        from shutil import which
+        self.exe = which("notify-send")
+        self.last_id = None
+
+    def __call__(self, summary: str, body: str = "", urgent: bool = False):
+        print(f"[probe] {summary}{' — ' + body if body else ''}", flush=True)
+        if not self.exe:
+            return
+        import subprocess
+        cmd = [self.exe, "-a", "TweenGlass", "-i", "video-display", "-p", "-t", "3000",
+               "-h", "boolean:transient:true", "-u", "critical" if urgent else "low"]
+        if self.last_id:
+            cmd += ["-r", self.last_id]
+        cmd += [summary, body]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout.strip()
+            self.last_id = out or self.last_id
+        except Exception:
+            pass
+
+
 class Shortcuts:
     """Global shortcuts (KWin script) that call back into the probe over D-Bus.
 
@@ -563,14 +611,19 @@ class Shortcuts:
 registerShortcut("TweenGlassProbeStop", "TweenGlass probe: quit", "{quit_keys}", function() {{
     callDBus("{n}", "{pth}", "{n}", "Quit");
 }});
-registerShortcut("TweenGlassProbeToggle", "TweenGlass probe: frame generation on/off for the active window",
-                 "{toggle_keys}", function() {{
+function tgToggle() {{
     var w = workspace.activeWindow;
     if (!w) {{ callDBus("{n}", "{pth}", "{n}", "Toggle", "", "", false); return; }}
     callDBus("{n}", "{pth}", "{n}", "Toggle", String(w.desktopFileName || w.resourceClass || ""),
              String(w.caption || ""), !!w.normalWindow);
-}});
+}}
+registerShortcut("TweenGlassProbeToggle", "TweenGlass probe: frame generation on/off for the active window",
+                 "{toggle_keys}", tgToggle);
 """
+        alt = altgr_variant(toggle_keys)
+        if alt:
+            js += (f'registerShortcut("TweenGlassProbeToggleAltGr", "TweenGlass probe: on/off (AltGr variant)", '
+                   f'"{alt}", tgToggle);\n')
         path = STATE_DIR / "shortcuts.js"
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(js)
@@ -580,8 +633,8 @@ registerShortcut("TweenGlassProbeToggle", "TweenGlass probe: frame generation on
             self.sp.run(["qdbus6", "org.kde.KWin", f"/Scripting/Script{sid}", "org.kde.kwin.Script.run"],
                         capture_output=True)
             self.ok = True
-            print(f"[probe] {toggle_keys} = frame generation on/off for the active window; "
-                  f"{quit_keys} = quit", flush=True)
+            print(f"[probe] {toggle_keys}{' (or ' + alt + ')' if alt else ''} = frame generation on/off "
+                  f"for the active window; {quit_keys} = quit", flush=True)
         else:
             print("[probe] WARNING: could not register KWin shortcuts (KDE Plasma only)", file=sys.stderr)
 
@@ -665,6 +718,7 @@ def main() -> None:
 
     cad = Cadence(Gst)
     loop = GLib.MainLoop()
+    notify = Notifier()
     state = {"pipe": None, "mpv": None, "restart_id": 0, "restarts": 0, "formats": 0, "hud": None,
              "active": False, "target": None, "t0": None}
 
@@ -780,10 +834,10 @@ def main() -> None:
         try:
             build(token)
         except BaseException as e:  # noqa: BLE001 — SystemExit from a cancelled portal dialog
-            print(f"[probe] could not start capture: {e}", file=sys.stderr)
             deactivate("start failed")
+            notify("TweenGlass: could not capture the window", str(e), urgent=True)
             return
-        print(f"[probe] ON  → {title or 'picked window'} ({app_id or '?'})", flush=True)
+        notify(f"TweenGlass ON — {args.multiplier}x", title or "picked window")
 
     def deactivate(reason: str = "toggled off"):
         if not state["active"]:
@@ -793,15 +847,17 @@ def main() -> None:
         if state["mpv"]:
             state["mpv"].close()
             state["mpv"] = None
-        print(f"[probe] OFF ({reason})", flush=True)
+        if reason == "quit":
+            print(f"[probe] OFF ({reason})", flush=True)
+        else:
+            notify("TweenGlass OFF", reason)
 
     def on_toggle(app_id: str, title: str, normal: bool):
         if state["active"]:
             deactivate()
             return
         if not normal or not app_id:
-            print(f"[probe] ignored: the active window can't be captured ({title or 'desktop/panel'})",
-                  flush=True)
+            notify("TweenGlass: click the window first", f"can't capture {title or 'the desktop/panel'}")
             return
         activate(app_id, title)
 
@@ -828,7 +884,7 @@ def main() -> None:
     if args.now or not shortcuts:
         activate()
     else:
-        print(f"[probe] ready — focus a window and press {args.toggle_keys}", flush=True)
+        notify("TweenGlass ready", f"Click the video window and press {args.toggle_keys}")
     if args.seconds:
         GLib.timeout_add(int(args.seconds * 1000), loop.quit)
 
