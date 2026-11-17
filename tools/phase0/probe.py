@@ -555,9 +555,9 @@ def shortcut_conflicts(Gio, GLib, bus, keys: str, own_action: str) -> list[str]:
     code = qt_key_code(keys)
     if code is None:
         return []
-    try:
+    try:  # args: (QKeySequence as (ai), SearchType as (i))
         res = bus.call_sync("org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel", "globalShortcutsByKey",
-                            GLib.Variant("((ai)(i))", (([code],), (0,)))  # (QKeySequence, SearchType), None, Gio.DBusCallFlags.NONE, 3000, None)
+                            GLib.Variant("((ai)(i))", (([code],), (0,))), None, Gio.DBusCallFlags.NONE, 3000, None)
     except Exception:
         return []
     out = []
