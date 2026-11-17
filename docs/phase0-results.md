@@ -21,3 +21,37 @@ Raw: delivered 694 frames, 604 unique, during roughly 30 s of playback followed 
 - Set `node.dont-fallback=true` on the stream, or PipeWire silently links the webcam.
 - The GStreamer Vulkan sink in this build only opens XCB windows (XWayland). This does not matter for the real renderer.
 - After a reboot, Hermes may lack `DISPLAY`/`WAYLAND_DISPLAY`/`XAUTHORITY`. Import them from `systemctl --user show-environment`.
+
+## 2026-11-17 — Source window resize (browser fullscreen) on KWin 6.8.3
+
+Symptom: the overlay froze for good as soon as the browser went fullscreen
+(and stayed frozen after leaving fullscreen).
+
+Measured with a 120 fps canvas page and a playing YouTube video:
+
+| Scenario | Capture fps |
+|---|---|
+| Stream started windowed (1920x970) | ~110 |
+| Same stream after window → fullscreen | 0 (one frame at 1920x1080, then nothing) |
+| Stream started while already fullscreen (1920x1080) | ~35–55 (follows content) |
+| Source covered by another fullscreen window / not minimized | rAF unaffected (Chrome does not throttle) |
+
+Cause: KWin's window screencast stops producing frames after a mid-stream
+renegotiation to a new size (`Failed to create an offscreen framebuffer`,
+`GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT` in the KWin log; the renegotiated
+memfd buffers are 1/10 of the frame size). Independent of `use-bufferpool`.
+Not an mpv problem.
+
+Workaround (probe): watch `pipewiresrc`'s format renegotiation (DEBUG log
+tap — it fires immediately, while the first new-size frame may never come)
+and, 600 ms later (fullscreen animation settles), close the portal session and
+open a new one with the restore token: no dialog, ~20–40 ms gap. Verified over
+4 fullscreen/windowed toggles with mpv + lsfg-vk running (no stall, mpv kept
+presenting ~46 fps).
+
+Renderer requirement: treat any source format change as "reconnect the
+stream" on KWin until upstream is fixed; worth an upstream KWin bug report.
+
+The KWin `showfps` overlay is now unloaded on every exit path (normal end,
+mpv closed, SIGINT/SIGTERM/SIGHUP); before it stayed on screen when the probe
+was killed.
