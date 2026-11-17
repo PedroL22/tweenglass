@@ -79,11 +79,15 @@ def find_lossless_dll() -> Path | None:
     return None
 
 
+def lsfg_env(args) -> dict:
+    """Per-presenter lsfg-vk settings (read when the presenter starts)."""
+    return {"LSFGVK_ENV": "1", "LSFGVK_MULTIPLIER": str(args.multiplier),
+            "LSFGVK_FLOW_SCALE": str(args.flow_scale),
+            "LSFGVK_PERFORMANCE_MODE": "1" if args.performance else "0"}
+
+
 def configure_lsfg(multiplier: int, flow_scale: float, performance: bool) -> None:
     os.environ.setdefault("LSFGVK_ENV", "1")
-    os.environ.setdefault("LSFGVK_MULTIPLIER", str(multiplier))
-    os.environ.setdefault("LSFGVK_FLOW_SCALE", str(flow_scale))
-    os.environ.setdefault("LSFGVK_PERFORMANCE_MODE", "1" if performance else "0")
     if "LSFGVK_DLL_PATH" not in os.environ:
         dll = find_lossless_dll()
         if dll:
@@ -333,6 +337,41 @@ def vulkan_devices() -> list[dict]:
     return devs
 
 
+def monitor_mode() -> dict | None:
+    """Largest enabled output's current mode {width, height, hz} (kscreen-doctor)."""
+    import subprocess
+    try:
+        out = subprocess.run(["kscreen-doctor", "-o"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return None
+    out = re.sub(r"\x1b\[[0-9;]*m", "", out)
+    modes = [(int(w), int(h), float(hz)) for w, h, hz in re.findall(r"\d+:(\d+)x(\d+)@([\d.]+)\*", out)]
+    if not modes:
+        return None
+    w, h, hz = max(modes, key=lambda m: m[0] * m[1])
+    return {"width": w, "height": h, "hz": round(hz, 2)}
+
+
+def system_checks(Gst) -> dict:
+    """First-run doctor: everything TweenGlass needs, without changing anything."""
+    import glob
+    layer_dirs = ["/usr/share/vulkan/implicit_layer.d", "/etc/vulkan/implicit_layer.d",
+                  str(Path.home() / ".local/share/vulkan/implicit_layer.d")]
+    layers = [f for d in layer_dirs for f in glob.glob(os.path.join(d, "*.json")) if "lsfg" in f.lower()]
+    dll = os.environ.get("LSFGVK_DLL_PATH") or (str(find_lossless_dll() or "") or None)
+    libs = ("/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/local/lib")
+    return {
+        "lsfg_layer": layers[0] if layers else None,
+        "lossless_dll": dll,
+        "gpus": vulkan_devices(),
+        "desktop": os.environ.get("XDG_CURRENT_DESKTOP", ""),
+        "wayland": bool(os.environ.get("WAYLAND_DISPLAY")),
+        "layer_shell": any(os.path.exists(os.path.join(d, "libgtk4-layer-shell.so")) for d in libs),
+        "pipewire_capture": Gst.ElementFactory.find("pipewiresrc") is not None,
+        "display": monitor_mode(),
+    }
+
+
 def monitor_size() -> tuple[int, int]:
     """Current mode of the largest enabled output (kscreen-doctor), fallback 1920x1080."""
     import subprocess
@@ -368,7 +407,7 @@ class MpvSink:
 
     def _spawn(self, w: int, h: int):
         import subprocess
-        env = dict(os.environ)
+        env = dict(os.environ, **lsfg_env(self.args))
         if self.args.sink == "overlay":
             cmd = [sys.executable, str(Path(__file__).with_name("overlay.py")), str(w), str(h)]
             env["GSK_RENDERER"] = "vulkan"
@@ -616,7 +655,8 @@ class Notifier:
 
 
 class Shortcuts:
-    """Global shortcuts (KWin script) that call back into the probe over D-Bus.
+    """Global shortcuts and window queries via KWin scripts, calling back into
+    the backend over D-Bus.
 
     The overlay is click-through and never takes keyboard focus, so it can only
     be driven by global shortcuts. The toggle callback receives the window that
@@ -629,11 +669,14 @@ class Shortcuts:
       <method name="Quit"/>
       <method name="Toggle"><arg type="s" name="app_id" direction="in"/>
         <arg type="s" name="title" direction="in"/><arg type="b" name="normal" direction="in"/></method>
+      <method name="Windows"><arg type="s" name="json" direction="in"/></method>
     </interface></node>"""
 
-    def __init__(self, Gio, GLib, bus, on_quit, on_toggle, quit_keys: str, toggle_keys: str):
+    def __init__(self, Gio, GLib, bus, on_quit, on_toggle, quit_keys: str | None, toggle_keys: str,
+                 on_windows=None):
         import subprocess
-        self.sp, self.ok, self.conflicts = subprocess, False, []
+        self.sp, self.ok, self.conflicts, self.alt = subprocess, False, [], None
+        self.Gio, self.GLib, self.bus = Gio, GLib, bus
         node = Gio.DBusNodeInfo.new_for_xml(self.XML)
 
         def call(_c, _s, _p, _i, method, params, inv):
@@ -643,41 +686,89 @@ class Shortcuts:
             elif method == "Toggle":
                 app_id, title, normal = params.unpack()
                 GLib.idle_add(lambda: (on_toggle(app_id, title, normal), False)[1])
+            elif method == "Windows" and on_windows:
+                (payload,) = params.unpack()
+                GLib.idle_add(lambda: (on_windows(json.loads(payload)), False)[1])
 
         bus.register_object(self.PATH, node.interfaces[0], call, None, None)
         Gio.bus_own_name_on_connection(bus, self.NAME, Gio.BusNameOwnerFlags.REPLACE, None, None)
+        self.register(toggle_keys, quit_keys)
+
+    def register(self, toggle_keys: str, quit_keys: str | None = None) -> None:
         n, pth = self.NAME, self.PATH
         js = f"""
-registerShortcut("TweenGlassProbeStop", "TweenGlass probe: quit", "{quit_keys}", function() {{
-    callDBus("{n}", "{pth}", "{n}", "Quit");
-}});
 function tgToggle() {{
     var w = workspace.activeWindow;
     if (!w) {{ callDBus("{n}", "{pth}", "{n}", "Toggle", "", "", false); return; }}
     callDBus("{n}", "{pth}", "{n}", "Toggle", String(w.desktopFileName || w.resourceClass || ""),
              String(w.caption || ""), !!w.normalWindow);
 }}
-registerShortcut("TweenGlassProbeToggle", "TweenGlass probe: frame generation on/off for the active window",
+registerShortcut("TweenGlassProbeToggle", "TweenGlass: frame generation on/off for the active window",
                  "{toggle_keys}", tgToggle);
 """
-        alt = altgr_variant(toggle_keys)
-        if alt:
-            js += (f'registerShortcut("TweenGlassProbeToggleAltGr", "TweenGlass probe: on/off (AltGr variant)", '
-                   f'"{alt}", tgToggle);\n')
-        path = STATE_DIR / "shortcuts.js"
+        if quit_keys:
+            js += (f'registerShortcut("TweenGlassProbeStop", "TweenGlass: quit", "{quit_keys}", function() {{'
+                   f' callDBus("{n}", "{pth}", "{n}", "Quit"); }});\n')
+        self.alt = altgr_variant(toggle_keys)
+        if self.alt:
+            js += (f'registerShortcut("TweenGlassProbeToggleAltGr", "TweenGlass: on/off (AltGr variant)", '
+                   f'"{self.alt}", tgToggle);\n')
+        self.close()
+        # kglobalaccel keeps the old key of an action that is registered again
+        # with a new default: drop the actions so the new keys take effect.
+        for action in ("TweenGlassProbeToggle", "TweenGlassProbeToggleAltGr", "TweenGlassProbeStop"):
+            try:
+                self.bus.call_sync("org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel", "unregister",
+                                   self.GLib.Variant("(ss)", ("kwin", action)), None,
+                                   self.Gio.DBusCallFlags.NONE, 2000, None)
+            except Exception:
+                pass
+        self.ok = self._run_script(js, self.SCRIPT)
+        if self.ok:
+            print(f"[probe] {toggle_keys}{' (or ' + self.alt + ')' if self.alt else ''} = frame generation on/off "
+                  f"for the active window{'; ' + quit_keys + ' = quit' if quit_keys else ''}", flush=True)
+            self.conflicts = shortcut_conflicts(self.Gio, self.GLib, self.bus, toggle_keys, "TweenGlassProbeToggle")
+        else:
+            self.conflicts = []
+            print("[probe] WARNING: could not register KWin shortcuts (KDE Plasma only)", file=sys.stderr)
+
+    def _run_script(self, js: str, name: str) -> bool:
+        path = STATE_DIR / f"{name}.js"
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(js)
-        self._kwin("unloadScript", self.SCRIPT)
-        sid = self._kwin("loadScript", str(path), self.SCRIPT).strip()
+        self._kwin("unloadScript", name)
+        sid = self._kwin("loadScript", str(path), name).strip()
         if sid.lstrip("-").isdigit() and int(sid) >= 0:
             self.sp.run(["qdbus6", "org.kde.KWin", f"/Scripting/Script{sid}", "org.kde.kwin.Script.run"],
                         capture_output=True)
-            self.ok = True
-            print(f"[probe] {toggle_keys}{' (or ' + alt + ')' if alt else ''} = frame generation on/off "
-                  f"for the active window; {quit_keys} = quit", flush=True)
-            self.conflicts = shortcut_conflicts(Gio, GLib, bus, toggle_keys, "TweenGlassProbeToggle")
-        else:
-            print("[probe] WARNING: could not register KWin shortcuts (KDE Plasma only)", file=sys.stderr)
+            return True
+        return False
+
+    def _oneshot(self, js: str, name: str) -> bool:
+        ok = self._run_script(js, name)
+        self.GLib.timeout_add(1500, lambda: (self._kwin("unloadScript", name), False)[1])
+        return ok
+
+    def list_windows(self, exclude_pid: int | None = None) -> bool:
+        """Ask KWin for the normal windows; the answer arrives via on_windows()."""
+        n, pth = self.NAME, self.PATH
+        return self._oneshot(f"""
+var a = workspace.activeWindow, out = [];
+for (const w of workspace.windowList()) {{
+    if (!w.normalWindow || w.skipTaskbar || w.pid == {exclude_pid or -1}) continue;
+    out.push({{ id: String(w.internalId), app_id: String(w.desktopFileName || w.resourceClass || ""),
+               title: String(w.caption || ""), fullscreen: !!w.fullScreen, minimized: !!w.minimized,
+               active: w === a }});
+}}
+callDBus("{n}", "{pth}", "{n}", "Windows", JSON.stringify(out));
+""", "tweenglass_list_windows")
+
+    def focus_window(self, window_id: str) -> bool:
+        wid = json.dumps(window_id)
+        return self._oneshot(f"""
+for (const w of workspace.windowList()) if (String(w.internalId) === {wid}) {{
+    w.minimized = false; workspace.activeWindow = w;
+}}""", "tweenglass_focus_window")
 
     def _kwin(self, method, *a) -> str:
         try:
@@ -719,7 +810,24 @@ def main() -> None:
     ap.add_argument("--forget", action="store_true", help="drop the saved portal restore token")
     ap.add_argument("--gpu", type=int, default=None,
                     help="Vulkan physical device index (see `vulkaninfo --summary`; default: the discrete GPU)")
+    ap.add_argument("--ipc", action="store_true",
+                    help="UI mode: JSON events on stdout, JSON commands on stdin (one object per line)")
     args = ap.parse_args()
+
+    # In IPC mode stdout carries only protocol lines; human logs go to stderr.
+    ipc_out = None
+    if args.ipc:
+        ipc_out = sys.stdout
+        sys.stdout = sys.stderr
+    import threading
+    ipc_lock = threading.Lock()
+
+    def emit(kind: str, **data) -> None:
+        if ipc_out is None:
+            return
+        with ipc_lock:
+            ipc_out.write(json.dumps({"type": kind, **data}) + "\n")
+            ipc_out.flush()
     if args.no_display:
         args.sink = "none"
     if args.canvas is None:
@@ -861,7 +969,15 @@ def main() -> None:
     Gst.debug_set_active(True)
     Gst.debug_set_threshold_for_name("pipewiresrc", Gst.DebugLevel.DEBUG)
 
-    def activate(app_id: str | None = None, title: str | None = None):
+    def emit_state(reason: str | None = None):
+        app_id, title = state["target"] or (None, None)
+        emit("state", active=state["active"], reason=reason,
+             target={"app_id": app_id, "title": title} if state["active"] else None,
+             settings={"multiplier": args.multiplier, "flow_scale": args.flow_scale,
+                       "performance": args.performance, "hud": not args.no_hud, "gpu": args.gpu,
+                       "toggle_keys": args.toggle_keys})
+
+    def activate(app_id: str | None = None, title: str | None = None, quiet: bool = False):
         token = None
         if app_id is not None:
             try:
@@ -875,12 +991,15 @@ def main() -> None:
         try:
             build(token)
         except BaseException as e:  # noqa: BLE001 — SystemExit from a cancelled portal dialog
-            deactivate("start failed")
+            deactivate("start failed", quiet=True)
+            emit("error", message=f"Could not capture the window: {e}")
             notify("TweenGlass: could not capture the window", str(e), urgent=True)
             return
-        notify(f"TweenGlass ON — {args.multiplier}x", title or "picked window")
+        emit_state("activated")
+        if not quiet:
+            notify(f"TweenGlass ON — {args.multiplier}x", title or "picked window")
 
-    def deactivate(reason: str = "toggled off"):
+    def deactivate(reason: str = "toggled off", quiet: bool = False):
         if not state["active"]:
             return
         state["active"] = False
@@ -888,10 +1007,27 @@ def main() -> None:
         if state["mpv"]:
             state["mpv"].close()
             state["mpv"] = None
-        if reason == "quit":
+        emit_state(reason)
+        if reason == "quit" or quiet:
             print(f"[probe] OFF ({reason})", flush=True)
         else:
             notify("TweenGlass OFF", reason)
+
+    def restart_presenter():
+        """Apply new lsfg-vk settings: they are read when the presenter starts."""
+        if not state["active"]:
+            return
+        teardown_stream()
+        if state["mpv"]:
+            state["mpv"].close()
+        state["mpv"] = MpvSink(args, Gst, cad) if has_presenter else None
+        try:
+            build()  # same window: token returned by the last Start
+        except BaseException as e:  # noqa: BLE001
+            deactivate("restart failed", quiet=True)
+            emit("error", message=f"Could not restart with the new settings: {e}")
+            return
+        emit_state("settings applied")
 
     def on_toggle(app_id: str, title: str, normal: bool):
         if state["active"]:
@@ -902,8 +1038,99 @@ def main() -> None:
             return
         activate(app_id, title)
 
-    shortcuts = (Shortcuts(Gio, GLib, portal.bus, loop.quit, on_toggle, args.stop_keys, args.toggle_keys)
+    def on_windows(items):
+        emit("windows", items=items)
+
+    shortcuts = (Shortcuts(Gio, GLib, portal.bus, loop.quit, on_toggle,
+                           None if args.ipc else args.stop_keys, args.toggle_keys, on_windows)
                  if has_presenter else None)
+
+    def emit_ready():
+        emit("ready", toggle_keys=args.toggle_keys, altgr_keys=shortcuts.alt if shortcuts else None,
+             shortcuts_ok=bool(shortcuts and shortcuts.ok), conflicts=shortcuts.conflicts if shortcuts else [])
+
+    # ---- UI commands (one JSON object per line on stdin)
+    def handle(cmd: dict):
+        c = cmd.get("cmd")
+        if c == "list_windows":
+            if not (shortcuts and shortcuts.list_windows(exclude_pid=os.getppid())):
+                emit("windows", items=[])
+        elif c == "activate":
+            if state["active"]:
+                deactivate("switching window", quiet=True)
+            app_id, title, wid = cmd.get("app_id") or "", cmd.get("title") or "", cmd.get("id")
+            if shortcuts and wid:
+                shortcuts.focus_window(wid)  # raise it: the overlay mirrors it and clicks land on it
+            GLib.timeout_add(350, lambda: (activate(app_id, title, quiet=True), False)[1])
+        elif c == "deactivate":
+            deactivate("stopped", quiet=True)
+        elif c == "set":
+            lsfg_changed = False
+            if "multiplier" in cmd:
+                v = max(2, min(4, int(cmd["multiplier"])))
+                lsfg_changed |= v != args.multiplier
+                args.multiplier = v
+            if "flow_scale" in cmd:
+                v = max(0.25, min(1.0, float(cmd["flow_scale"])))
+                lsfg_changed |= v != args.flow_scale
+                args.flow_scale = v
+            if "performance" in cmd:
+                v = bool(cmd["performance"])
+                lsfg_changed |= v != args.performance
+                args.performance = v
+            if "gpu" in cmd:
+                v = cmd["gpu"] if cmd["gpu"] is None else int(cmd["gpu"])
+                lsfg_changed |= v != args.gpu
+                args.gpu = v
+            if "hud" in cmd:
+                args.no_hud = not bool(cmd["hud"])
+                if state["hud"] is not None:
+                    state["hud"].set_property("silent", args.no_hud)
+            if cmd.get("toggle_keys") and cmd["toggle_keys"] != args.toggle_keys and shortcuts:
+                args.toggle_keys = cmd["toggle_keys"]
+                shortcuts.register(args.toggle_keys)
+                emit_ready()
+            if lsfg_changed:
+                restart_presenter()
+            emit_state("settings")
+        elif c == "checks":
+            emit("checks", **system_checks(Gst))
+        elif c == "state":
+            emit_state()
+        elif c == "quit":
+            loop.quit()
+        else:
+            emit("error", message=f"unknown command {c!r}")
+
+    stdin_buf = bytearray()
+
+    def on_stdin(_source, condition):
+        # Read raw bytes: a buffered readline() would swallow several queued
+        # commands at once and GLib would never wake us up for the rest.
+        data = b""
+        if condition & GLib.IOCondition.IN:
+            try:
+                data = os.read(sys.stdin.fileno(), 65536)
+            except BlockingIOError:
+                return True
+        if not data:
+            loop.quit()  # EOF: the UI went away
+            return False
+        stdin_buf.extend(data)
+        while b"\n" in stdin_buf:
+            line, _, rest = bytes(stdin_buf).partition(b"\n")
+            stdin_buf[:] = rest
+            if not line.strip():
+                continue
+            try:
+                handle(json.loads(line))
+            except Exception as e:  # noqa: BLE001 — never let a bad command kill the backend
+                emit("error", message=f"bad command {line[:200]!r}: {e}")
+        return True
+
+    if args.ipc:
+        GLib.io_add_watch(GLib.IOChannel.unix_new(sys.stdin.fileno()), GLib.PRIORITY_DEFAULT,
+                          GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR, on_stdin)
 
     # Always close the presenter and the KWin script, even on SIGTERM/SIGHUP.
     import atexit, signal
@@ -922,7 +1149,11 @@ def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal_add(GLib.PRIORITY_HIGH, sig, lambda *_: (loop.quit(), False)[1])
 
-    if args.now or not shortcuts:
+    if args.ipc:
+        emit("hello", protocol=1)
+        emit_ready()
+        emit_state("started")
+    elif args.now or not shortcuts:
         activate()
     else:
         if shortcuts.conflicts:
@@ -948,6 +1179,16 @@ def main() -> None:
 
     GLib.timeout_add_seconds(5, progress)
 
+    def stats_tick():
+        mpv = state["mpv"]
+        if state["active"] and mpv and mpv.proc:
+            emit("stats", base=round(mpv.base_fps(2.0), 1), output=round(mpv.output_fps(2.0), 1),
+                 capture=round(cad.recent(2.0)[1], 1), reconnects=state["restarts"])
+        return True
+
+    if args.ipc:
+        GLib.timeout_add(1000, stats_tick)
+
     def hud_tick():
         mpv = state["mpv"]
         if mpv and mpv.proc:
@@ -965,7 +1206,7 @@ def main() -> None:
     had_data = bool(cad.t)
     cleanup()
 
-    if had_data:
+    if had_data and not args.ipc:
         rep = cad.report()
         print("[probe] RESULT (last activation) " + json.dumps(rep, indent=2))
         out = Path(os.environ.get("TWEENGLASS_PROBE_OUT", "phase0-result.json"))
