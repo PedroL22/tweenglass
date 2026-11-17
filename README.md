@@ -34,12 +34,13 @@ TweenGlass does **not** include lsfg-vk or any Lossless Scaling files. It only d
 Phase 0 probe (validates capture, frame cadence and the lsfg-vk hook):
 
 ```sh
-/usr/bin/python3 tools/phase0/probe.py --multiplier 2 --seconds 3600
+/usr/bin/python3 tools/phase0/probe.py --multiplier 2
 ```
 
+- Runs in the background until you quit it. Focus any window and press **`Ctrl+Alt+S`** to turn frame generation on for it; press again to turn it off (KDE global shortcuts, `--toggle-keys` / `--stop-keys` to change). No picker dialog: the active window is pre-selected through the portal's restore data. `--now` starts at once with the last window instead.
 - Put the source (e.g. the browser video) in **fullscreen**: the overlay covers the whole output and is click-through, so clicks only land in the right place when the source is 1:1 with the screen.
 - Top-left counter: `base / output` fps. *Base* = new frames from the window; *output* = frames the overlay process actually handed to the compositor (lsfg-vk's generated frames included, counted from its Wayland buffer attaches).
-- Stop: `Meta+Alt+Q` (KDE global shortcut, `--stop-keys` to change) or Ctrl+C in the terminal.
+- Quit: `Meta+Alt+Q` or Ctrl+C in the terminal.
 - `--sink mpv` keeps the old mpv window presenter (not click-through).
 
 See [`docs/plan.md`](docs/plan.md) for the roadmap.

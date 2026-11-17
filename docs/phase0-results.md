@@ -94,3 +94,25 @@ it. Pitfalls:
 The HUD (`base / output`) is burned into the frames with GStreamer
 `textoverlay`, so it adds no presents. `keepalive-time` keeps it updating
 while the source is static (paused video shows `0 / 0`).
+
+## 2026-11-17 — Hotkey toggle on the active window (no picker dialog)
+
+`Ctrl+Alt+S` (KWin `registerShortcut`) reads `workspace.activeWindow` and
+calls the probe over D-Bus with `(desktopFileName, caption)`. To capture that
+exact window without the portal dialog, the probe writes its own restore entry
+into the permission store and passes its token to `SelectSources`:
+
+- xdg-desktop-portal 1.22: the token must be a UUID string
+  (`g_uuid_string_is_valid`), the entry lives in table `screencast` with
+  permissions `{"": ["yes"]}` (host apps), and it is deleted after use.
+- xdg-desktop-portal-kde 6.8: data = `(suv) ("KDE", 1, payload)`, where payload is a
+  QDataStream `QVariantMap {"windows": QList<WindowRestoreInfo>{(appId, title)}}`
+  (user-type QVariant: u32 65536, u8 0, QByteArray type name, list).
+  Windows are matched by appId plus exact or close title (Levenshtein < len/2).
+
+Verified with a 30 fps mpv test window: toggle ON → overlay showed that
+window (`31 / 60` at x2), OFF → presenter gone, ON again works, quit shortcut
+unloads the KWin script with no leftover processes. This depends on KDE
+internals. The Rust renderer should use KWin's `zkde_screencast_unstable_v1`
+`stream_window(uuid)` directly on Plasma, with the portal + dialog as the
+generic fallback.

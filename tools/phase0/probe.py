@@ -133,7 +133,40 @@ class Portal:
             raise SystemExit(f"[probe] portal {method} cancelled/failed (code {result.get('code')})")
         return result["res"]
 
-    def start_window_cast(self) -> tuple[int, int, dict]:
+    def forge_window_token(self, app_id: str, title: str) -> str:
+        """Create a restore token that makes xdg-desktop-portal-kde pick the
+        given window without showing its chooser dialog.
+
+        The KDE backend restores window casts by (appId, title) — see
+        tryMatchWindows() in xdg-desktop-portal-kde/src/screencast.cpp — from
+        restore data xdg-desktop-portal keeps in the permission store
+        (table "screencast", key = token, value = (suv) "KDE", 1, payload).
+        The payload is a QDataStream-serialised QVariantMap:
+          {"windows": QList<WindowRestoreInfo>{ {appId, title} }}
+        xdg-desktop-portal deletes the entry once it is used."""
+        import struct
+        import uuid
+        GLib = self.GLib
+
+        def qstr(v: str) -> bytes:
+            b = v.encode("utf-16-be")
+            return struct.pack(">I", len(b)) + b
+
+        type_name = b"QList<WindowRestoreInfo>\0"
+        payload = (struct.pack(">I", 1) + qstr("windows")
+                   + struct.pack(">IB", 65536, 0)                  # QVariant: user type, not null
+                   + struct.pack(">I", len(type_name)) + type_name  # ... named by its metatype
+                   + struct.pack(">I", 1) + qstr(app_id) + qstr(title))
+        token = str(uuid.uuid4())  # xdg-desktop-portal requires a UUID string
+        data = GLib.Variant("(suv)", ("KDE", 1, GLib.Variant("ay", payload)))
+        self.bus.call_sync(
+            "org.freedesktop.impl.portal.PermissionStore", "/org/freedesktop/impl/portal/PermissionStore",
+            "org.freedesktop.impl.portal.PermissionStore", "Set",
+            GLib.Variant("(sbsa{sas}v)", ("screencast", True, token, {"": ["yes"]}, data)),
+            None, self.Gio.DBusCallFlags.NONE, 5000, None)
+        return token
+
+    def start_window_cast(self, restore_token: str | None = None) -> tuple[int, int, dict]:
         GLib = self.GLib
         V = GLib.Variant
 
@@ -152,14 +185,17 @@ class Portal:
             "cursor_mode": V("u", 1),  # HIDDEN — the real cursor is drawn by the compositor
             "persist_mode": V("u", 2), # persistent until revoked
         }
-        if TOKEN_FILE.is_file():
+        if restore_token:
+            opts["restore_token"] = V("s", restore_token)
+        elif TOKEN_FILE.is_file():
             opts["restore_token"] = V("s", TOKEN_FILE.read_text().strip())
         tok = self._token()
         opts["handle_token"] = V("s", tok)
         self._request("SelectSources", V("(oa{sv})", (session, opts)), tok)
 
         tok = self._token()
-        print("[probe] Pick the window to capture in the KDE dialog...")
+        if "restore_token" not in opts:
+            print("[probe] Pick the window to capture in the KDE dialog...")
         res = self._request("Start", V("(osa{sv})", (session, "", {"handle_token": V("s", tok)})), tok)
         if "restore_token" in res:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -491,32 +527,51 @@ class MpvSink:
                 pass
 
 
-class StopShortcut:
-    """Global shortcut (KWin script) that stops the probe over D-Bus.
+class Shortcuts:
+    """Global shortcuts (KWin script) that call back into the probe over D-Bus.
 
-    The overlay is click-through and never takes keyboard focus, so it cannot
-    be closed with the mouse or a key press of its own."""
+    The overlay is click-through and never takes keyboard focus, so it can only
+    be driven by global shortcuts. The toggle callback receives the window that
+    is active when the keys are pressed (KWin knows it; Wayland clients don't)."""
 
     NAME = "dev.tweenglass.Probe"
     PATH = "/dev/tweenglass/Probe"
-    SCRIPT = "tweenglass_probe_stop"
-    XML = f"""<node><interface name="{NAME}"><method name="Quit"/></interface></node>"""
+    SCRIPT = "tweenglass_probe_shortcuts"
+    XML = f"""<node><interface name="{NAME}">
+      <method name="Quit"/>
+      <method name="Toggle"><arg type="s" name="app_id" direction="in"/>
+        <arg type="s" name="title" direction="in"/><arg type="b" name="normal" direction="in"/></method>
+    </interface></node>"""
 
-    def __init__(self, Gio, bus, on_quit, keys: str):
+    def __init__(self, Gio, GLib, bus, on_quit, on_toggle, quit_keys: str, toggle_keys: str):
         import subprocess
         self.sp, self.ok = subprocess, False
         node = Gio.DBusNodeInfo.new_for_xml(self.XML)
 
-        def call(_c, _s, _p, _i, method, _params, inv):
+        def call(_c, _s, _p, _i, method, params, inv):
             inv.return_value(None)
             if method == "Quit":
-                on_quit()
+                GLib.idle_add(lambda: (on_quit(), False)[1])
+            elif method == "Toggle":
+                app_id, title, normal = params.unpack()
+                GLib.idle_add(lambda: (on_toggle(app_id, title, normal), False)[1])
 
         bus.register_object(self.PATH, node.interfaces[0], call, None, None)
         Gio.bus_own_name_on_connection(bus, self.NAME, Gio.BusNameOwnerFlags.REPLACE, None, None)
-        js = (f'registerShortcut("TweenGlassProbeStop", "TweenGlass probe: stop", "{keys}", function() {{'
-              f' callDBus("{self.NAME}", "{self.PATH}", "{self.NAME}", "Quit"); }});')
-        path = STATE_DIR / "stop-shortcut.js"
+        n, pth = self.NAME, self.PATH
+        js = f"""
+registerShortcut("TweenGlassProbeStop", "TweenGlass probe: quit", "{quit_keys}", function() {{
+    callDBus("{n}", "{pth}", "{n}", "Quit");
+}});
+registerShortcut("TweenGlassProbeToggle", "TweenGlass probe: frame generation on/off for the active window",
+                 "{toggle_keys}", function() {{
+    var w = workspace.activeWindow;
+    if (!w) {{ callDBus("{n}", "{pth}", "{n}", "Toggle", "", "", false); return; }}
+    callDBus("{n}", "{pth}", "{n}", "Toggle", String(w.desktopFileName || w.resourceClass || ""),
+             String(w.caption || ""), !!w.normalWindow);
+}});
+"""
+        path = STATE_DIR / "shortcuts.js"
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(js)
         self._kwin("unloadScript", self.SCRIPT)
@@ -525,7 +580,10 @@ class StopShortcut:
             self.sp.run(["qdbus6", "org.kde.KWin", f"/Scripting/Script{sid}", "org.kde.kwin.Script.run"],
                         capture_output=True)
             self.ok = True
-            print(f"[probe] press {keys} to stop", flush=True)
+            print(f"[probe] {toggle_keys} = frame generation on/off for the active window; "
+                  f"{quit_keys} = quit", flush=True)
+        else:
+            print("[probe] WARNING: could not register KWin shortcuts (KDE Plasma only)", file=sys.stderr)
 
     def _kwin(self, method, *a) -> str:
         try:
@@ -544,16 +602,21 @@ class StopShortcut:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--seconds", type=float, default=60, help="measurement time after the stream starts")
+    ap.add_argument("--seconds", type=float, default=0,
+                    help="quit after N seconds (0 = run until the quit shortcut / Ctrl+C)")
+    ap.add_argument("--now", action="store_true",
+                    help="start capturing immediately (last window / portal dialog) instead of waiting for the toggle shortcut")
     ap.add_argument("--sink", choices=["overlay", "mpv", "vulkan", "none"], default="overlay",
                     help="overlay: click-through fullscreen layer-shell overlay (GTK4/Vulkan) — default; "
                          "mpv: fullscreen mpv window (Vulkan, takes clicks); "
                          "vulkan: GStreamer vulkansink (XWayland, fixed-size); none: measure only")
     ap.add_argument("--no-display", action="store_true", help="alias for --sink none")
     ap.add_argument("--canvas", type=lambda v: tuple(int(x) for x in v.lower().split("x")), default=None,
-                    help="mpv input size WxH (default: largest active monitor mode)")
+                    help="presenter input size WxH (default: largest active monitor mode)")
     ap.add_argument("--windowed", action="store_true", help="mpv: start windowed instead of fullscreen")
-    ap.add_argument("--stop-keys", default="Meta+Alt+Q", help="global shortcut that stops the probe (KDE)")
+    ap.add_argument("--toggle-keys", default="Ctrl+Alt+S",
+                    help="global shortcut: frame generation on/off for the active window (KDE)")
+    ap.add_argument("--stop-keys", default="Meta+Alt+Q", help="global shortcut that quits the probe (KDE)")
     ap.add_argument("--no-hud", action="store_true",
                     help="hide the 'base / output' fps counter drawn in the top-left corner")
     ap.add_argument("--multiplier", type=int, default=2)
@@ -561,7 +624,7 @@ def main() -> None:
     ap.add_argument("--performance", action="store_true")
     ap.add_argument("--forget", action="store_true", help="drop the saved portal restore token")
     ap.add_argument("--gpu", type=int, default=None,
-                    help="Vulkan physical device index for vulkansink (see `vulkaninfo --summary`)")
+                    help="Vulkan physical device index (see `vulkaninfo --summary`; default: the discrete GPU)")
     args = ap.parse_args()
     if args.no_display:
         args.sink = "none"
@@ -585,39 +648,25 @@ def main() -> None:
 
     # Normalise to BGRA (KWin already sends BGRA/BGRx; videoconvert is then a
     # passthrough). vulkansink needs vulkancolorconvert in front of it.
+    presenter_chain = (
+        # Fixed canvas: the source window changes size (e.g. the browser going
+        # fullscreen 1920x970 -> 1920x1080), but the presenter's raw input cannot.
+        # Letterbox every frame into the canvas instead of dropping it.
+        "videoconvert ! videoscale add-borders=true method=bilinear ! "
+        f"video/x-raw,format=BGRA,width={args.canvas[0]},height={args.canvas[1]},pixel-aspect-ratio=1/1 ! "
+        f"{HUD} ! appsink name=out emit-signals=true max-buffers=2 drop=true sync=false")
     sink = {
         "none": "fakesink sync=false",
         "vulkan": "videoconvert ! video/x-raw,format=BGRA ! vulkanupload ! vulkancolorconvert ! vulkansink sync=false",
-        # Fixed canvas: the source window changes size (e.g. the browser going
-        # fullscreen 1920x970 -> 1920x1080), but mpv's rawvideo input cannot.
-        # Letterbox every frame into the canvas instead of dropping it.
-        "overlay": None,
-        "mpv": ("videoconvert ! videoscale add-borders=true method=bilinear ! "
-                f"video/x-raw,format=BGRA,width={args.canvas[0]},height={args.canvas[1]},pixel-aspect-ratio=1/1 ! "
-                f"{HUD} ! appsink name=out emit-signals=true max-buffers=2 drop=true sync=false"),
-    }
-    sink["overlay"] = sink["mpv"]
-    sink = sink[args.sink]
+        "overlay": presenter_chain,
+        "mpv": presenter_chain,
+    }[args.sink]
+    has_presenter = args.sink in ("mpv", "overlay")
 
     cad = Cadence(Gst)
-    mpv = MpvSink(args, Gst, cad) if args.sink in ("mpv", "overlay") else None
     loop = GLib.MainLoop()
-
-    # Always close mpv, even on SIGTERM/SIGHUP.
-    import atexit, signal
-
-    stopper = StopShortcut(Gio, portal.bus, loop.quit, args.stop_keys) if mpv else None
-
-    def cleanup():
-        if stopper:
-            stopper.close()
-        if mpv:
-            mpv.close()
-    atexit.register(cleanup)
-    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
-        GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, lambda *_: (loop.quit(), False)[1])
-
-    state = {"pipe": None, "restart_id": 0, "restarts": 0, "formats": 0}
+    state = {"pipe": None, "mpv": None, "restart_id": 0, "restarts": 0, "formats": 0, "hud": None,
+             "active": False, "target": None, "t0": None}
 
     def on_msg(_b, msg):
         if msg.type == Gst.MessageType.ERROR:
@@ -625,23 +674,23 @@ def main() -> None:
             print(f"[probe] GStreamer error: {err.message} — reconnecting\n{dbg}", file=sys.stderr)
             schedule_restart()
         elif msg.type == Gst.MessageType.EOS:
-            loop.quit()
+            deactivate("source ended")
 
-    def build():
-        fd, node, props = portal.start_window_cast()
+    def build(restore_token: str | None = None):
+        fd, node, props = portal.start_window_cast(restore_token)
         print(f"[probe] PipeWire node {node} props={dict(props)}", flush=True)
         # Target by object serial: with pipewiresrc >= 1.x, `path=<node id>` may be
         # ignored and silently fall back to the default source (e.g. the webcam).
         serial = props.get("pipewire-serial")
         target = f"target-object={serial}" if serial is not None else f"path={node}"
-        keepalive = "keepalive-time=500 " if mpv else ""
+        keepalive = "keepalive-time=500 " if has_presenter else ""
         pipe = Gst.parse_launch(
             f"pipewiresrc name=src fd={fd} {target} do-timestamp=true {keepalive}"
             f"stream-properties=\"props,node.dont-fallback=(boolean)true,node.dont-reconnect=(boolean)true\" "
             f"! video/x-raw ! queue max-size-buffers=2 leaky=downstream ! {sink}")
         pipe.get_by_name("src").get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, cad.probe)
-        if mpv:
-            pipe.get_by_name("out").connect("new-sample", mpv.on_sample)
+        if state["mpv"]:
+            pipe.get_by_name("out").connect("new-sample", state["mpv"].on_sample)
             state["hud"] = pipe.get_by_name("hud")
             state["hud"].set_property("silent", args.no_hud)
         bus = pipe.get_bus()
@@ -650,18 +699,32 @@ def main() -> None:
         pipe.set_state(Gst.State.PLAYING)
         state["pipe"] = pipe
 
-    def restart():
-        state["restart_id"] = 0
-        state["restarts"] += 1
-        t = time.monotonic()
+    def teardown_stream():
+        if state["restart_id"]:
+            GLib.source_remove(state["restart_id"])
+            state["restart_id"] = 0
         old = state["pipe"]
+        state["pipe"], state["hud"] = None, None
         if old is not None:
             old.get_bus().remove_signal_watch()
             old.set_state(Gst.State.NULL)
         portal.close_session()
         cad.caps = None  # the next stream's first size is not a "change"
         state["formats"] = 0
-        build()
+
+    def restart():
+        state["restart_id"] = 0
+        if not state["active"]:
+            return False
+        state["restarts"] += 1
+        t = time.monotonic()
+        teardown_stream()
+        try:
+            build()  # token returned by the previous Start (same window, no dialog)
+        except BaseException as e:  # noqa: BLE001 — portal refused; give up on this window
+            print(f"[probe] reconnect failed: {e}", file=sys.stderr)
+            deactivate("reconnect failed")
+            return False
         print(f"[probe] stream reconnected in {(time.monotonic() - t) * 1000:.0f} ms "
               f"(#{state['restarts']})", flush=True)
         return False
@@ -674,6 +737,8 @@ def main() -> None:
         # animation settles first; otherwise the new stream starts at the stale
         # size and breaks again.
         def arm():
+            if not state["active"]:
+                return False
             if state["restart_id"]:
                 GLib.source_remove(state["restart_id"])
             state["restart_id"] = GLib.timeout_add(RESTART_DEBOUNCE_MS, restart)
@@ -701,50 +766,109 @@ def main() -> None:
     Gst.debug_set_active(True)
     Gst.debug_set_threshold_for_name("pipewiresrc", Gst.DebugLevel.DEBUG)
 
-    build()
-    print(f"[probe] Measuring for {args.seconds:.0f}s — play the video now.")
-    GLib.timeout_add(int(args.seconds * 1000), loop.quit)
+    def activate(app_id: str | None = None, title: str | None = None):
+        token = None
+        if app_id is not None:
+            try:
+                token = portal.forge_window_token(app_id, title or "")
+            except Exception as e:  # noqa: BLE001
+                print(f"[probe] could not pre-select the window ({e}); the portal will ask", file=sys.stderr)
+        state["mpv"] = MpvSink(args, Gst, cad) if has_presenter else None
+        state["active"], state["target"], state["t0"] = True, (app_id, title), time.monotonic()
+        cad.__init__(Gst)
+        cad.on_resize = schedule_restart
+        try:
+            build(token)
+        except BaseException as e:  # noqa: BLE001 — SystemExit from a cancelled portal dialog
+            print(f"[probe] could not start capture: {e}", file=sys.stderr)
+            deactivate("start failed")
+            return
+        print(f"[probe] ON  → {title or 'picked window'} ({app_id or '?'})", flush=True)
 
-    t0 = time.monotonic()
+    def deactivate(reason: str = "toggled off"):
+        if not state["active"]:
+            return
+        state["active"] = False
+        teardown_stream()
+        if state["mpv"]:
+            state["mpv"].close()
+            state["mpv"] = None
+        print(f"[probe] OFF ({reason})", flush=True)
+
+    def on_toggle(app_id: str, title: str, normal: bool):
+        if state["active"]:
+            deactivate()
+            return
+        if not normal or not app_id:
+            print(f"[probe] ignored: the active window can't be captured ({title or 'desktop/panel'})",
+                  flush=True)
+            return
+        activate(app_id, title)
+
+    shortcuts = (Shortcuts(Gio, GLib, portal.bus, loop.quit, on_toggle, args.stop_keys, args.toggle_keys)
+                 if has_presenter else None)
+
+    # Always close the presenter and the KWin script, even on SIGTERM/SIGHUP.
+    import atexit, signal
+
+    def cleanup():
+        deactivate("quit")
+        if shortcuts:
+            shortcuts.close()
+    atexit.register(cleanup)
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        signal_add = GLibUnix.signal_add
+    except (ImportError, ValueError):
+        signal_add = GLib.unix_signal_add
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal_add(GLib.PRIORITY_HIGH, sig, lambda *_: (loop.quit(), False)[1])
+
+    if args.now or not shortcuts:
+        activate()
+    else:
+        print(f"[probe] ready — focus a window and press {args.toggle_keys}", flush=True)
+    if args.seconds:
+        GLib.timeout_add(int(args.seconds * 1000), loop.quit)
 
     def progress():
-        d, u = cad.recent(5.0)
-        extra = (f" base={mpv.base_fps(5.0):.1f}fps output={mpv.output_fps(5.0):.1f}fps"
-                 f" (written_to_mpv={mpv.recent(5.0)})") if mpv and mpv.proc else ""
-        print(f"[probe] t+{time.monotonic() - t0:.0f}s last5s: delivered={d}fps unique={u}fps{extra} "
-              f"dups_total={cad.dups} reconnects={state['restarts']}", flush=True)
+        mpv = state["mpv"]
+        if state["active"]:
+            d, u = cad.recent(5.0)
+            extra = (f" base={mpv.base_fps(5.0):.1f}fps output={mpv.output_fps(5.0):.1f}fps"
+                     f" (written={mpv.recent(5.0)})") if mpv and mpv.proc else ""
+            print(f"[probe] t+{time.monotonic() - state['t0']:.0f}s last5s: delivered={d}fps unique={u}fps{extra} "
+                  f"dups_total={cad.dups} reconnects={state['restarts']}", flush=True)
         if mpv and mpv.proc and mpv.proc.poll() is not None:
-            print("[probe] presenter closed — stopping", flush=True)
-            loop.quit()
-            return False
+            deactivate("presenter closed")
         return True
 
     GLib.timeout_add_seconds(5, progress)
 
     def hud_tick():
+        mpv = state["mpv"]
         if mpv and mpv.proc:
             text = f"{mpv.base_fps():.0f} / {mpv.output_fps():.0f}"
             mpv.hud_text = text
-            if state.get("hud") is not None:
+            if state["hud"] is not None:
                 state["hud"].set_property("text", text)
         return True
 
-    if mpv:
-        GLib.timeout_add(500, hud_tick)
+    GLib.timeout_add(500, hud_tick)
     try:
         loop.run()
     except KeyboardInterrupt:
         pass
-    if state["pipe"] is not None:
-        state["pipe"].set_state(Gst.State.NULL)
-    portal.close_session()
+    had_data = bool(cad.t)
     cleanup()
 
-    rep = cad.report()
-    print("[probe] RESULT " + json.dumps(rep, indent=2))
-    out = Path(os.environ.get("TWEENGLASS_PROBE_OUT", "phase0-result.json"))
-    out.write_text(json.dumps(rep, indent=2))
-    print(f"[probe] saved {out.resolve()}")
+    if had_data:
+        rep = cad.report()
+        print("[probe] RESULT (last activation) " + json.dumps(rep, indent=2))
+        out = Path(os.environ.get("TWEENGLASS_PROBE_OUT", "phase0-result.json"))
+        out.write_text(json.dumps(rep, indent=2))
+        print(f"[probe] saved {out.resolve()}")
 
 
 if __name__ == "__main__":
