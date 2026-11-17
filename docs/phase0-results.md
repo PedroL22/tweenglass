@@ -116,3 +116,60 @@ unloads the KWin script with no leftover processes. This depends on KDE
 internals. The Rust renderer should use KWin's `zkde_screencast_unstable_v1`
 `stream_window(uuid)` directly on Plasma, with the portal + dialog as the
 generic fallback.
+
+
+## 2026-11-17 — A/V latency and GPU filters
+
+Pedro's complaint: with TweenGlass on, voices come before the lips.
+
+### Video latency, measured on screen
+
+Method: a source mpv window shows the frame number as 10 binary bands. The
+overlay is restricted to the rest of the screen (`TWEENGLASS_OVERLAY_REGION`
+debug env, `x,y,w,h` in logical px). Each KWin screenshot (spectacle) contains
+the source and its copy at the same instant, so
+`(source frame − overlay frame) / fps` is the added delay. The resolution is
+one source frame, so these are means over 12–16 screenshots. Test conditions:
+1080p fullscreen source, overlay almost fullscreen, lsfg-vk 2.0 on the RTX
+3050, 120 Hz. Harness: `tg_latfs.py` (scratch, not committed).
+
+| source fps | lsfg | filter | delay |
+|---|---|---|---|
+| 30 | off | – | 38–42 ms |
+| 30 | 2x | – | 38–45 ms |
+| 30 | 3x | – | 39 ms |
+| 24 | 2x | – | 48 ms |
+| 30 | 2x | FSR | 57 ms |
+| 30 | 2x | BCAS | ~67 ms (all reads = 2 frames) |
+
+Model: `1 source frame + 5 ms + (processing − 3.5 ms)`, where processing is
+measured live per frame from pipewiresrc arrival to the presenter handoff
+(3.5–3.7 ms on the CPU path).
+
+### Audio delay
+
+`pw-loopback --delay D` adds exactly D. This was measured inaudibly: a
+combine-sink sends the same click directly to a null sink and through the
+loopback, and the two clicks land 40/100/200 ms apart for D = 40/100/200 ms.
+The loopback's own buffering is compensated, so `--delay 0` adds nothing.
+The app's streams are matched by PID tree (window PID from KWin), falling back
+to the app name for Flatpak. They are moved via `pw-metadata <id> target.object`
+and the metadata is deleted on stop. WirePlumber's `stream-properties` stays
+clean; `AudioSync._forget_targets` cleans it if a target ever gets saved.
+
+### GPU filters (GStreamer GL, Intel iGPU via Mesa EGL)
+
+Per-frame cost at 1080p, from chain entry to a mapped (downloaded) buffer:
+nearest 7.3 ms, SGSR 9.3, bicubic 13.4, FSR 16.9, BCAS 17.3. The CPU bilinear
+path is 3.5 ms. Benchmarks must map the output buffer: gldownload is lazy, and
+a fakesink alone measured 0.7 ms.
+
+- Dropping the final glcolorconvert saves ~1 ms: the last shader writes BGRA
+  byte order into an RGBA-labelled buffer. Relabelling GL memory with
+  capssetter breaks the video meta (`gst_video_frame_map_id: assertion
+  'info->finfo->format == meta->format'`).
+- NVIDIA EGL (`__EGL_VENDOR_LIBRARY_FILENAMES=…10_nvidia.json`) can't create
+  an EGLDisplay on this KWin session. The filter falls back to off, with a UI
+  error.
+- 1:1 sources (fullscreen video) skip the scaling kernel; only the sharpening
+  pass does work.

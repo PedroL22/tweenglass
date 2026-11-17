@@ -51,6 +51,16 @@ def main() -> None:
         LayerShell.init_for_window(win)
         LayerShell.set_namespace(win, "tweenglass")
         LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+        region = os.environ.get("TWEENGLASS_OVERLAY_REGION")  # debug/measurement: "x,y,w,h" (logical px)
+        if region:
+            # Anchor all four edges and let margins carve out the rectangle: the
+            # compositor then dictates the size (a picture's natural size can't grow it).
+            rx, ry, rw, rh = (int(v) for v in region.split(","))
+            mon = Gdk.Display.get_default().get_monitors().get_item(0).get_geometry()
+            margins = {LayerShell.Edge.LEFT: rx, LayerShell.Edge.TOP: ry,
+                       LayerShell.Edge.RIGHT: mon.width - rx - rw, LayerShell.Edge.BOTTOM: mon.height - ry - rh}
+            for edge, m in margins.items():
+                LayerShell.set_margin(win, edge, max(0, m))
         for edge in (LayerShell.Edge.TOP, LayerShell.Edge.BOTTOM, LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT):
             LayerShell.set_anchor(win, edge, True)
         LayerShell.set_exclusive_zone(win, -1)  # cover panels too

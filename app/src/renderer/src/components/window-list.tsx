@@ -97,7 +97,7 @@ export function WindowList({ b, t }: { b: BackendView; t: Strings }) {
                     <Button
                       size="sm"
                       variant="secondary"
-                      onClick={() => send({ cmd: "activate", id: w.id, app_id: w.app_id, title: w.title })}
+                      onClick={() => send({ cmd: "activate", id: w.id, app_id: w.app_id, title: w.title, pid: w.pid })}
                     >
                       <Play className="size-3.5 fill-current" />
                       {t.activate}

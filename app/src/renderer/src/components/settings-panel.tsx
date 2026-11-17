@@ -10,7 +10,7 @@ import { Switch } from "@/components/ui/switch";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import type { BackendView } from "@/hooks/use-backend";
 import { fmt, type Strings } from "../../../shared/i18n";
-import type { Settings } from "../../../shared/protocol";
+import { FILTERS, type FilterId, SHARPNESS_FILTERS, type Settings } from "../../../shared/protocol";
 import { Keys } from "./status-card";
 
 function Row({ title, hint, children }: { title: string; hint?: string; children: React.ReactNode }) {
@@ -86,7 +86,136 @@ function ShortcutRecorder({ value, onChange, t }: { value: string; onChange: (v:
   );
 }
 
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <Card className="gap-4 py-4">
+      <CardContent className="flex flex-col gap-5 px-4">
+        <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">{title}</h2>
+        {children}
+      </CardContent>
+    </Card>
+  );
+}
+
+/** Slider that only tells the backend on release (each change may rebuild the stream). */
+function CommitSlider(props: {
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onCommit: (v: number) => void;
+  render: (v: number) => React.ReactNode;
+  title: string;
+  hint?: string;
+}) {
+  const [v, setV] = useState(props.value);
+  useEffect(() => setV(props.value), [props.value]);
+  return (
+    <div className="space-y-3">
+      <Row title={props.title} hint={props.hint}>
+        <span className="font-mono text-sm tabular-nums">{props.render(v)}</span>
+      </Row>
+      <Slider
+        min={props.min}
+        max={props.max}
+        step={props.step}
+        value={[v]}
+        onValueChange={([x]) => setV(x)}
+        onValueCommit={([x]) => props.onCommit(x)}
+      />
+    </div>
+  );
+}
+
+function ImageSection({ b, t }: { b: BackendView; t: Strings }) {
+  const s = b.settings;
+  const names = t as unknown as Record<string, string>;
+  const cost = b.state?.active && s.filter !== "off" && b.stats?.processing_ms != null
+    ? Math.max(0, Math.round(b.stats.processing_ms - 3.5))
+    : null;
+  return (
+    <Section title={t.imageSection}>
+      <div className="space-y-2">
+        <div className="space-y-0.5">
+          <Label className="text-sm">{t.filter}</Label>
+          <p className="text-xs leading-snug text-muted-foreground">{t.filterHint}</p>
+        </div>
+        <Select value={s.filter} onValueChange={(v) => b.update({ filter: v as FilterId })}>
+          <SelectTrigger size="sm" className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {FILTERS.map((f) => (
+              <SelectItem key={f} value={f}>
+                {names[`filterNames_${f}`] ?? f}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {cost !== null && <p className="text-xs text-muted-foreground">{fmt(t.filterCost, { ms: cost })}</p>}
+      </div>
+      {SHARPNESS_FILTERS.includes(s.filter) && (
+        <CommitSlider
+          title={t.sharpness}
+          value={s.sharpness}
+          min={0}
+          max={1}
+          step={0.05}
+          render={(v) => `${Math.round(v * 100)}%`}
+          onCommit={(v) => b.update({ sharpness: Math.round(v * 100) / 100 })}
+        />
+      )}
+    </Section>
+  );
+}
+
+function AudioSection({ b, t }: { b: BackendView; t: Strings }) {
+  const s = b.settings;
+  const active = b.state?.active ?? false;
+  let status = t.audioIdle;
+  if (active && s.audio_sync) {
+    status = b.stats?.audio_delay_ms != null
+      ? b.stats.audio_streams > 0
+        ? fmt(t.audioNow, { ms: b.stats.audio_delay_ms })
+        : t.audioNoStream
+      : t.audioIdle;
+  }
+  return (
+    <Section title={t.audioSection}>
+      <Row title={t.audioSync} hint={t.audioSyncHint}>
+        <Switch checked={s.audio_sync} onCheckedChange={(v) => b.update({ audio_sync: v })} />
+      </Row>
+      {s.audio_sync && (
+        <>
+          <CommitSlider
+            title={t.audioOffset}
+            hint={t.audioOffsetHint}
+            value={s.audio_offset_ms}
+            min={-100}
+            max={300}
+            step={5}
+            render={(v) => `${v > 0 ? "+" : ""}${Math.round(v)} ms`}
+            onCommit={(v) => b.update({ audio_offset_ms: Math.round(v) })}
+          />
+          <p className="text-xs text-primary/90">{status}</p>
+        </>
+      )}
+    </Section>
+  );
+}
+
 export function SettingsPanel({ b, t }: { b: BackendView; t: Strings }) {
+  return (
+    <div className="flex flex-col gap-3">
+      <FrameGenSection b={b} t={t} />
+      <ImageSection b={b} t={t} />
+      <AudioSection b={b} t={t} />
+      <p className="px-1 text-xs text-muted-foreground">{t.appliesNextTime}</p>
+    </div>
+  );
+}
+
+function FrameGenSection({ b, t }: { b: BackendView; t: Strings }) {
   const s = b.settings;
   const [flow, setFlow] = useState(s.flow_scale);
   useEffect(() => setFlow(s.flow_scale), [s.flow_scale]);
@@ -95,8 +224,7 @@ export function SettingsPanel({ b, t }: { b: BackendView; t: Strings }) {
   const gpus = b.checks?.gpus ?? [];
 
   return (
-    <Card className="py-4">
-      <CardContent className="flex flex-col gap-5 px-4">
+    <Section title={t.fgSection}>
         <div className="space-y-2">
           <Row title={t.multiplier} hint={t.multiplierHint}>
             <ToggleGroup
@@ -177,8 +305,6 @@ export function SettingsPanel({ b, t }: { b: BackendView; t: Strings }) {
             <p className="text-xs text-muted-foreground">{fmt(t.shortcutAltGr, { keys: b.ready.altgr_keys })}</p>
           )}
         </div>
-        <p className="text-xs text-muted-foreground">{t.appliesNextTime}</p>
-      </CardContent>
-    </Card>
+    </Section>
   );
 }

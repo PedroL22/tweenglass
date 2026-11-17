@@ -35,6 +35,10 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import filters  # noqa: E402  (GLSL scaling/sharpening filters)
+from audio_sync import AudioSync, video_latency_ms  # noqa: E402
+
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "tweenglass"
 TOKEN_FILE = STATE_DIR / "phase0-restore-token"
 RESTART_DEBOUNCE_MS = 600
@@ -240,6 +244,7 @@ class Cadence:
         self.on_resize = None  # callback(w, h) when the source size changes mid-stream
         import collections
         self.dup_pts = collections.OrderedDict()  # pts -> is_duplicate (bounded)
+        self.arrival = collections.OrderedDict()  # pts -> monotonic arrival time (bounded)
 
     def probe(self, pad, info):
         Gst = self.Gst
@@ -269,8 +274,11 @@ class Cadence:
                 self.unique_t.append(now)
             self.last_hash = h
             self.dup_pts[buf.pts] = dup
+            self.arrival[buf.pts] = now
             while len(self.dup_pts) > 64:
                 self.dup_pts.popitem(last=False)
+            while len(self.arrival) > 64:
+                self.arrival.popitem(last=False)
         return Gst.PadProbeReturn.OK
 
     @staticmethod
@@ -404,6 +412,8 @@ class MpvSink:
         self.cv = threading.Condition()
         self.pending: bytes | None = None
         self.closed = False
+        self.proc_ms: float | None = None  # EMA: capture arrival -> frame handed to the presenter
+        self.proc_n = 0
 
     def _spawn(self, w: int, h: int):
         import subprocess
@@ -527,6 +537,13 @@ class MpvSink:
             self.hud_written = hud
             if self.proc.poll() is None:
                 frame = bytes(m.data[: w * h * 4])
+                t_in = self.cad.arrival.get(buf.pts)
+                if t_in is not None and not src_dup:
+                    # Skip the warm-up (shader compile, first allocations) and outliers.
+                    self.proc_n += 1
+                    ms = (time.monotonic() - t_in) * 1000
+                    if self.proc_n > 15 and ms < 250:
+                        self.proc_ms = ms if self.proc_ms is None else self.proc_ms * 0.9 + ms * 0.1
                 with self.cv:
                     self.pending = (frame, not src_dup)  # replaces an unwritten older frame
                     self.cv.notify()
@@ -668,7 +685,8 @@ class Shortcuts:
     XML = f"""<node><interface name="{NAME}">
       <method name="Quit"/>
       <method name="Toggle"><arg type="s" name="app_id" direction="in"/>
-        <arg type="s" name="title" direction="in"/><arg type="b" name="normal" direction="in"/></method>
+        <arg type="s" name="title" direction="in"/><arg type="b" name="normal" direction="in"/>
+        <arg type="s" name="pid" direction="in"/></method>
       <method name="Windows"><arg type="s" name="json" direction="in"/></method>
     </interface></node>"""
 
@@ -684,8 +702,8 @@ class Shortcuts:
             if method == "Quit":
                 GLib.idle_add(lambda: (on_quit(), False)[1])
             elif method == "Toggle":
-                app_id, title, normal = params.unpack()
-                GLib.idle_add(lambda: (on_toggle(app_id, title, normal), False)[1])
+                app_id, title, normal, pid = params.unpack()
+                GLib.idle_add(lambda: (on_toggle(app_id, title, normal, int(pid) if pid.isdigit() else None), False)[1])
             elif method == "Windows" and on_windows:
                 (payload,) = params.unpack()
                 GLib.idle_add(lambda: (on_windows(json.loads(payload)), False)[1])
@@ -699,9 +717,9 @@ class Shortcuts:
         js = f"""
 function tgToggle() {{
     var w = workspace.activeWindow;
-    if (!w) {{ callDBus("{n}", "{pth}", "{n}", "Toggle", "", "", false); return; }}
+    if (!w) {{ callDBus("{n}", "{pth}", "{n}", "Toggle", "", "", false, ""); return; }}
     callDBus("{n}", "{pth}", "{n}", "Toggle", String(w.desktopFileName || w.resourceClass || ""),
-             String(w.caption || ""), !!w.normalWindow);
+             String(w.caption || ""), !!w.normalWindow, String(w.pid || ""));
 }}
 registerShortcut("TweenGlassProbeToggle", "TweenGlass: frame generation on/off for the active window",
                  "{toggle_keys}", tgToggle);
@@ -758,7 +776,7 @@ for (const w of workspace.windowList()) {{
     if (!w.normalWindow || w.skipTaskbar || w.pid == {exclude_pid or -1}) continue;
     out.push({{ id: String(w.internalId), app_id: String(w.desktopFileName || w.resourceClass || ""),
                title: String(w.caption || ""), fullscreen: !!w.fullScreen, minimized: !!w.minimized,
-               active: w === a }});
+               active: w === a, pid: Number(w.pid || 0) }});
 }}
 callDBus("{n}", "{pth}", "{n}", "Windows", JSON.stringify(out));
 """, "tweenglass_list_windows")
@@ -807,6 +825,13 @@ def main() -> None:
     ap.add_argument("--multiplier", type=int, default=2)
     ap.add_argument("--flow-scale", type=float, default=1.0)
     ap.add_argument("--performance", action="store_true")
+    ap.add_argument("--filter", choices=filters.FILTERS, default="off",
+                    help="scaling/sharpening filter (GPU): " + ", ".join(filters.FILTERS))
+    ap.add_argument("--sharpness", type=float, default=0.5, help="0..1, for fsr / sgsr / bcas")
+    ap.add_argument("--no-audio-sync", action="store_true",
+                    help="don't delay the captured app's audio to match the overlay")
+    ap.add_argument("--audio-offset", type=float, default=0.0,
+                    help="ms added to the automatic audio delay (negative = less delay)")
     ap.add_argument("--forget", action="store_true", help="drop the saved portal restore token")
     ap.add_argument("--gpu", type=int, default=None,
                     help="Vulkan physical device index (see `vulkaninfo --summary`; default: the discrete GPU)")
@@ -850,30 +875,45 @@ def main() -> None:
 
     # Normalise to BGRA (KWin already sends BGRA/BGRx; videoconvert is then a
     # passthrough). vulkansink needs vulkancolorconvert in front of it.
-    presenter_chain = (
+    def presenter_chain() -> str:
         # Fixed canvas: the source window changes size (e.g. the browser going
         # fullscreen 1920x970 -> 1920x1080), but the presenter's raw input cannot.
         # Letterbox every frame into the canvas instead of dropping it.
-        "videoconvert ! videoscale add-borders=true method=bilinear ! "
-        f"video/x-raw,format=BGRA,width={args.canvas[0]},height={args.canvas[1]},pixel-aspect-ratio=1/1 ! "
-        f"{HUD} ! appsink name=out emit-signals=true max-buffers=2 drop=true sync=false")
-    sink = {
-        "none": "fakesink sync=false",
-        "vulkan": "videoconvert ! video/x-raw,format=BGRA ! vulkanupload ! vulkancolorconvert ! vulkansink sync=false",
-        "overlay": presenter_chain,
-        "mpv": presenter_chain,
-    }[args.sink]
+        if args.filter != "off":
+            scale = f"videoconvert ! {filters.gl_chain(args.filter, args.canvas)} ! "
+        else:
+            scale = ("videoconvert ! videoscale add-borders=true method=bilinear ! "
+                     f"video/x-raw,format=BGRA,width={args.canvas[0]},height={args.canvas[1]},pixel-aspect-ratio=1/1 ! ")
+        # max-buffers=1: never queue a stale frame in front of the presenter (latency).
+        return scale + f"{HUD} ! appsink name=out emit-signals=true max-buffers=1 drop=true sync=false"
+
     has_presenter = args.sink in ("mpv", "overlay")
+
+    def sink_chain() -> str:
+        return {
+            "none": "fakesink sync=false",
+            "vulkan": "videoconvert ! video/x-raw,format=BGRA ! vulkanupload ! vulkancolorconvert ! vulkansink sync=false",
+        }.get(args.sink) or presenter_chain()
+
+    audio = AudioSync(log=lambda m: print(m, flush=True))
 
     cad = Cadence(Gst)
     loop = GLib.MainLoop()
     notify = Notifier()
     state = {"pipe": None, "mpv": None, "restart_id": 0, "restarts": 0, "formats": 0, "hud": None,
-             "active": False, "target": None, "t0": None}
+             "active": False, "target": None, "t0": None, "pid": None}
 
     def on_msg(_b, msg):
         if msg.type == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()
+            src = msg.src.get_name() if msg.src else ""
+            if args.filter != "off" and src.startswith(("tgf", "gl")):
+                # No usable OpenGL (ES) for the filter: keep going without it.
+                print(f"[probe] filter {args.filter} failed ({err.message}); disabling it", file=sys.stderr)
+                emit("error", message=f"The {args.filter} filter could not run on this GPU ({err.message}). "
+                                      "Frame generation continues without it.")
+                args.filter = "off"
+                emit_state("settings")
             print(f"[probe] GStreamer error: {err.message} — reconnecting\n{dbg}", file=sys.stderr)
             schedule_restart()
         elif msg.type == Gst.MessageType.EOS:
@@ -890,7 +930,9 @@ def main() -> None:
         pipe = Gst.parse_launch(
             f"pipewiresrc name=src fd={fd} {target} do-timestamp=true {keepalive}"
             f"stream-properties=\"props,node.dont-fallback=(boolean)true,node.dont-reconnect=(boolean)true\" "
-            f"! video/x-raw ! queue max-size-buffers=2 leaky=downstream ! {sink}")
+            f"! video/x-raw ! queue max-size-buffers=2 leaky=downstream ! {sink_chain()}")
+        if has_presenter and args.filter != "off":
+            filters.configure(pipe, Gst, args.filter, args.canvas, args.sharpness)
         pipe.get_by_name("src").get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, cad.probe)
         if state["mpv"]:
             pipe.get_by_name("out").connect("new-sample", state["mpv"].on_sample)
@@ -975,9 +1017,24 @@ def main() -> None:
              target={"app_id": app_id, "title": title} if state["active"] else None,
              settings={"multiplier": args.multiplier, "flow_scale": args.flow_scale,
                        "performance": args.performance, "hud": not args.no_hud, "gpu": args.gpu,
-                       "toggle_keys": args.toggle_keys})
+                       "toggle_keys": args.toggle_keys, "filter": args.filter, "sharpness": args.sharpness,
+                       "audio_sync": not args.no_audio_sync, "audio_offset_ms": args.audio_offset})
 
-    def activate(app_id: str | None = None, title: str | None = None, quiet: bool = False):
+    def audio_target_ms() -> float:
+        mpv = state["mpv"]
+        base = mpv.base_fps(3.0) if mpv and mpv.proc else 0.0
+        # The on-screen model (1 frame + 5 ms) was measured with the CPU path,
+        # whose processing takes ~3.5 ms; add whatever a GPU filter costs on top.
+        extra = max(0.0, (mpv.proc_ms or 0.0) - 3.5) if mpv else 0.0
+        return max(0.0, video_latency_ms(base) + extra + args.audio_offset)
+
+    def start_audio():
+        if args.no_audio_sync or not state["active"] or not has_presenter:
+            return
+        if not audio.start(state["pid"], (state["target"] or ("", ""))[0] or "", audio_target_ms()):
+            emit("error", message="Audio sync unavailable (needs PipeWire with pw-loopback, pw-metadata and pactl).")
+
+    def activate(app_id: str | None = None, title: str | None = None, quiet: bool = False, pid: int | None = None):
         token = None
         if app_id is not None:
             try:
@@ -986,6 +1043,7 @@ def main() -> None:
                 print(f"[probe] could not pre-select the window ({e}); the portal will ask", file=sys.stderr)
         state["mpv"] = MpvSink(args, Gst, cad) if has_presenter else None
         state["active"], state["target"], state["t0"] = True, (app_id, title), time.monotonic()
+        state["pid"] = pid
         cad.__init__(Gst)
         cad.on_resize = schedule_restart
         try:
@@ -995,6 +1053,7 @@ def main() -> None:
             emit("error", message=f"Could not capture the window: {e}")
             notify("TweenGlass: could not capture the window", str(e), urgent=True)
             return
+        start_audio()
         emit_state("activated")
         if not quiet:
             notify(f"TweenGlass ON — {args.multiplier}x", title or "picked window")
@@ -1003,6 +1062,7 @@ def main() -> None:
         if not state["active"]:
             return
         state["active"] = False
+        audio.stop()
         teardown_stream()
         if state["mpv"]:
             state["mpv"].close()
@@ -1029,14 +1089,26 @@ def main() -> None:
             return
         emit_state("settings applied")
 
-    def on_toggle(app_id: str, title: str, normal: bool):
+    def rebuild_stream():
+        """Apply a new filter: rebuild only the capture pipeline; the presenter
+        (and lsfg-vk) keep running because the canvas size does not change."""
+        if not state["active"]:
+            return
+        teardown_stream()
+        try:
+            build()
+        except BaseException as e:  # noqa: BLE001
+            deactivate("restart failed", quiet=True)
+            emit("error", message=f"Could not apply the filter: {e}")
+
+    def on_toggle(app_id: str, title: str, normal: bool, pid: int | None = None):
         if state["active"]:
             deactivate()
             return
         if not normal or not app_id:
             notify("TweenGlass: click the window first", f"can't capture {title or 'the desktop/panel'}")
             return
-        activate(app_id, title)
+        activate(app_id, title, pid=pid)
 
     def on_windows(items):
         emit("windows", items=items)
@@ -1059,9 +1131,10 @@ def main() -> None:
             if state["active"]:
                 deactivate("switching window", quiet=True)
             app_id, title, wid = cmd.get("app_id") or "", cmd.get("title") or "", cmd.get("id")
+            pid = int(cmd["pid"]) if str(cmd.get("pid") or "").isdigit() and int(cmd["pid"]) > 0 else None
             if shortcuts and wid:
                 shortcuts.focus_window(wid)  # raise it: the overlay mirrors it and clicks land on it
-            GLib.timeout_add(350, lambda: (activate(app_id, title, quiet=True), False)[1])
+            GLib.timeout_add(350, lambda: (activate(app_id, title, quiet=True, pid=pid), False)[1])
         elif c == "deactivate":
             deactivate("stopped", quiet=True)
         elif c == "set":
@@ -1086,12 +1159,31 @@ def main() -> None:
                 args.no_hud = not bool(cmd["hud"])
                 if state["hud"] is not None:
                     state["hud"].set_property("silent", args.no_hud)
+            filter_changed = False
+            if "filter" in cmd and cmd["filter"] in filters.FILTERS and cmd["filter"] != args.filter:
+                args.filter, filter_changed = cmd["filter"], True
+            if "sharpness" in cmd:
+                v = max(0.0, min(1.0, float(cmd["sharpness"])))
+                filter_changed |= v != args.sharpness and args.filter in filters.SHARPNESS_FILTERS
+                args.sharpness = v
+            if "audio_offset_ms" in cmd:
+                args.audio_offset = max(-200.0, min(500.0, float(cmd["audio_offset_ms"])))
+                if audio.sink:
+                    audio.set_delay(audio_target_ms())
+            if "audio_sync" in cmd:
+                args.no_audio_sync = not bool(cmd["audio_sync"])
+                if args.no_audio_sync:
+                    audio.stop()
+                elif state["active"] and not audio.sink:
+                    start_audio()
             if cmd.get("toggle_keys") and cmd["toggle_keys"] != args.toggle_keys and shortcuts:
                 args.toggle_keys = cmd["toggle_keys"]
                 shortcuts.register(args.toggle_keys)
                 emit_ready()
             if lsfg_changed:
                 restart_presenter()
+            elif filter_changed:
+                rebuild_stream()
             emit_state("settings")
         elif c == "checks":
             emit("checks", **system_checks(Gst))
@@ -1137,6 +1229,7 @@ def main() -> None:
 
     def cleanup():
         deactivate("quit")
+        audio.stop()
         if shortcuts:
             shortcuts.close()
     atexit.register(cleanup)
@@ -1183,7 +1276,9 @@ def main() -> None:
         mpv = state["mpv"]
         if state["active"] and mpv and mpv.proc:
             emit("stats", base=round(mpv.base_fps(2.0), 1), output=round(mpv.output_fps(2.0), 1),
-                 capture=round(cad.recent(2.0)[1], 1), reconnects=state["restarts"])
+                 capture=round(cad.recent(2.0)[1], 1), reconnects=state["restarts"],
+                 audio_delay_ms=round(audio.delay_ms) if audio.sink else None, audio_streams=audio.streams,
+                 processing_ms=round(mpv.proc_ms, 1) if mpv.proc_ms is not None else None)
         return True
 
     if args.ipc:
@@ -1199,6 +1294,22 @@ def main() -> None:
         return True
 
     GLib.timeout_add(500, hud_tick)
+
+    tick = {"n": 0}
+
+    def audio_tick():
+        # New streams appear whenever the app starts another video/tab; follow
+        # the content frame rate (24/30/60 fps) every few seconds.
+        if state["active"] and audio.sink:
+            audio.poll()
+            tick["n"] += 1
+            mpv = state["mpv"]
+            settled = state["t0"] is not None and time.monotonic() - state["t0"] > 3
+            if settled and tick["n"] % 3 == 0 and mpv and mpv.base_fps(3.0) >= 5 and mpv.proc_ms is not None:
+                audio.set_delay(audio_target_ms())
+        return True
+
+    GLib.timeout_add(1000, audio_tick)
     try:
         loop.run()
     except KeyboardInterrupt:

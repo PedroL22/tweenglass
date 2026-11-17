@@ -20,6 +20,7 @@ Exit criteria:
 
 ## Phase 2: UI (Electron + React + shadcn/ui) — first version done (2026-11-17)
 Built on the Python backend (`probe.py --ipc`) until the Rust renderer exists: tray, window list with icons (activate = focus the window + forged portal restore token, no dialog), live base/output fps, live settings (lsfg settings restart the presenter on the same window), shortcut recorder with conflict warning, first-run doctor, pt-BR/en. Still open: thumbnails, presets, GlobalShortcuts portal outside KDE.
+- 2026-11-17: A/V sync (app audio through a `pw-loopback --delay` of `1 frame + 5 ms + filter time`), GPU filters (FSR 1, SGSR, BCAS, bicubic, sharp bilinear, integer, nearest). Next filters: NIS, Anime4K (multi-pass, needs named intermediate textures), xBR. The Rust renderer should run the filters in Vulkan on the presenting GPU to drop the GL upload/download (~4 ms).
 
 - Window picker (portal) with a live thumbnail, one large **Activate** button, and a global shortcut (GlobalShortcuts portal).
 - Presets: Film/series, YouTube 60, Game; auto-suggested from measured fps and display Hz.

@@ -29,6 +29,8 @@ export function settingsArgs(s: Settings): string[] {
   if (s.performance) args.push("--performance");
   if (!s.hud) args.push("--no-hud");
   if (s.gpu !== null) args.push("--gpu", String(s.gpu));
+  args.push("--filter", s.filter, "--sharpness", String(s.sharpness), "--audio-offset", String(s.audio_offset_ms));
+  if (!s.audio_sync) args.push("--no-audio-sync");
   return args;
 }
 
