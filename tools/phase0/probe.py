@@ -38,6 +38,11 @@ from pathlib import Path
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "tweenglass"
 TOKEN_FILE = STATE_DIR / "phase0-restore-token"
 RESTART_DEBOUNCE_MS = 600
+# Lossless Scaling–style "base / output" counter, burned into the frames we
+# hand to mpv (so it costs no extra presents). Size is relative to the canvas.
+HUD = ("textoverlay name=hud text=\"\" valignment=top halignment=left xpad=12 ypad=8 "
+       "font-desc=\"Monospace Bold 6\" color=0xFFE6E6E6 draw-shadow=true draw-outline=true outline-color=0xC0000000 "
+       "shaded-background=false")
 
 
 # --------------------------------------------------------------------------
@@ -193,6 +198,8 @@ class Cadence:
         self.last_hash: bytes | None = None
         self.caps = None
         self.on_resize = None  # callback(w, h) when the source size changes mid-stream
+        import collections
+        self.dup_pts = collections.OrderedDict()  # pts -> is_duplicate (bounded)
 
     def probe(self, pad, info):
         Gst = self.Gst
@@ -215,11 +222,15 @@ class Cadence:
             step = max(1, len(data) // 65536)
             h = hashlib.blake2b(bytes(data[::step]), digest_size=16).digest()
             buf.unmap(m)
-            if h == self.last_hash:
+            dup = h == self.last_hash
+            if dup:
                 self.dups += 1
             else:
                 self.unique_t.append(now)
             self.last_hash = h
+            self.dup_pts[buf.pts] = dup
+            while len(self.dup_pts) > 64:
+                self.dup_pts.popitem(last=False)
         return Gst.PadProbeReturn.OK
 
     @staticmethod
@@ -271,6 +282,21 @@ def nvidia_device_name() -> str | None:
     return None
 
 
+def vulkan_devices() -> list[dict]:
+    """[{index, name, vendor, device, discrete}] from `vulkaninfo --summary`."""
+    import subprocess
+    try:
+        out = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return []
+    devs = []
+    for i, block in enumerate(re.split(r"\nGPU\d+:\n", out)[1:]):
+        g = lambda k: (re.search(rf"{k}\s*=\s*(.+)", block) or [None, ""])[1].strip()
+        devs.append({"index": i, "name": g("deviceName"), "vendor": g("vendorID").replace("0x", ""),
+                     "device": g("deviceID").replace("0x", ""), "discrete": "DISCRETE" in g("deviceType")})
+    return devs
+
+
 def monitor_size() -> tuple[int, int]:
     """Current mode of the largest enabled output (kscreen-doctor), fallback 1920x1080."""
     import subprocess
@@ -289,12 +315,16 @@ class MpvSink:
     """Pipe raw BGRA frames into mpv (gpu-next/Vulkan). Only *new* content
     frames are written, so lsfg-vk interpolates between distinct images."""
 
-    def __init__(self, args, Gst):
-        self.args, self.Gst = args, Gst
+    def __init__(self, args, Gst, cadence):
+        self.args, self.Gst, self.cad = args, Gst, cadence
         self.proc = None
         self.size = None
         self.last_hash = None
-        self.written: list[float] = []
+        self.written: list[float] = []       # every frame handed to mpv
+        self.base_t: list[float] = []        # ... of which carried NEW source content
+        self.present_t: list[float] = []     # buffers mpv's process attached to its surface
+        self.hud_text = ""
+        self.hud_written = ""
         import threading
         self.cv = threading.Condition()
         self.pending: bytes | None = None
@@ -302,6 +332,24 @@ class MpvSink:
 
     def _spawn(self, w: int, h: int):
         import subprocess
+        env = dict(os.environ)
+        if self.args.sink == "overlay":
+            cmd = [sys.executable, str(Path(__file__).with_name("overlay.py")), str(w), str(h)]
+            env["GSK_RENDERER"] = "vulkan"
+            # GTK's frame clock coalesces our frames once lsfg-vk adds its own
+            # presents (30 in -> ~25 drawn at 2x). We only redraw when a new
+            # frame arrives, so painting immediately costs nothing extra.
+            env["GDK_DEBUG"] = "no-vsync"
+            devs = vulkan_devices()
+            dev = (next((d for d in devs if d["index"] == self.args.gpu), None) if self.args.gpu is not None
+                   else next((d for d in devs if d["discrete"]), None))
+            if dev:
+                # GTK always takes Vulkan device 0 (the iGPU here: lsfg ran at ~5 fps).
+                # Mesa's device-select layer with "!" hides every other GPU.
+                env["MESA_VK_DEVICE_SELECT"] = f"{dev['vendor']}:{dev['device']}!"
+                print(f"[probe] overlay GPU: {dev['name']}", flush=True)
+            self._popen(cmd, env)
+            return
         cmd = [
             "mpv", "--no-config", "--really-quiet", "--title=TweenGlass probe",
             "--demuxer=rawvideo", f"--demuxer-rawvideo-w={w}", f"--demuxer-rawvideo-h={h}",
@@ -317,18 +365,43 @@ class MpvSink:
             f"--input-ipc-server={STATE_DIR / 'probe-mpv.sock'}",
         ]
         if not self.args.windowed:
-            # --ontop: stay above the source window when the user focuses it to
-            # toggle its fullscreen (the real renderer uses a layer-shell overlay).
-            cmd += ["--fs", "--ontop"]
+            cmd += ["--fs"]
         dev = nvidia_device_name() if self.args.gpu != 0 else None
         if dev and self.args.gpu is not None:
             cmd.append(f"--vulkan-device={dev}")
         cmd.append("-")
         print(f"[probe] mpv: {' '.join(cmd)}", flush=True)
+        self._popen(cmd, env)
+
+    def _popen(self, cmd, env):
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0)
+        # WAYLAND_DEBUG makes libwayland log every request of the mpv process.
+        # Each wl_surface.attach of a buffer is one frame handed to the
+        # compositor — including the frames lsfg-vk generates inside
+        # vkQueuePresentKHR. That is the real output frame rate.
+        import subprocess
+        env = dict(env, WAYLAND_DEBUG="client")
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, env=env)
         import threading
         threading.Thread(target=self._writer, daemon=True).start()
+        threading.Thread(target=self._wayland_reader, daemon=True).start()
+
+    _ATTACH = re.compile(rb"-> wl_surface#(\d+)\.attach\((?!nil)")
+
+    def _wayland_reader(self):
+        """Count buffer attaches per surface; the busiest surface is the video."""
+        import collections
+        per_surface: dict[bytes, collections.deque] = {}
+        for line in self.proc.stderr:
+            m = self._ATTACH.search(line)
+            if m:
+                now = time.monotonic()
+                dq = per_surface.setdefault(m.group(1), collections.deque(maxlen=1024))
+                dq.append(now)
+                main = max(per_surface.values(), key=lambda d: sum(1 for t in d if now - t <= 1.0))
+                self.present_t = main
+            elif not line.startswith(b"[") and line.strip():
+                sys.stderr.write("[presenter] " + line.decode(errors="replace"))
 
     def _writer(self):
         """Write frames off the GStreamer streaming thread; keep only the newest
@@ -340,9 +413,13 @@ class MpvSink:
                 if self.closed:
                     return
                 frame, self.pending = self.pending, None
+            frame, is_base = frame
             try:
                 self.proc.stdin.write(frame)
-                self.written.append(time.monotonic())
+                now = time.monotonic()
+                self.written.append(now)
+                if is_base:
+                    self.base_t.append(now)
             except (BrokenPipeError, OSError, ValueError):
                 return
 
@@ -359,66 +436,108 @@ class MpvSink:
         if (w, h) != self.size:  # cannot happen with the fixed canvas caps
             return Gst.FlowReturn.OK
         buf = sample.get_buffer()
+        self.base_t = self.base_t[-512:]
+        self.written = self.written[-512:]
         ok, m = buf.map(Gst.MapFlags.READ)
         if not ok:
             return Gst.FlowReturn.OK
         try:
-            data = m.data
-            step = max(1, len(data) // 65536)
-            hsh = hashlib.blake2b(bytes(data[::step]), digest_size=16).digest()
-            if hsh == self.last_hash:
-                return Gst.FlowReturn.OK  # duplicate: do not present
-            self.last_hash = hsh
+            # Duplicate = same SOURCE content (decided before the HUD is drawn).
+            # Present it only if the HUD text changed (e.g. keepalive buffers
+            # while the video is paused), never as a "base" frame.
+            src_dup = self.cad.dup_pts.get(buf.pts, False)
+            hud = self.hud_text
+            if src_dup and hud == self.hud_written:
+                return Gst.FlowReturn.OK
+            self.hud_written = hud
             if self.proc.poll() is None:
-                frame = bytes(data[: w * h * 4])
+                frame = bytes(m.data[: w * h * 4])
                 with self.cv:
-                    self.pending = frame  # replaces an unwritten older frame
+                    self.pending = (frame, not src_dup)  # replaces an unwritten older frame
                     self.cv.notify()
         finally:
             buf.unmap(m)
         return Gst.FlowReturn.OK
 
-    def recent(self, window: float) -> float:
+    @staticmethod
+    def _rate(ts, window: float) -> float:
         now = time.monotonic()
-        return round(sum(1 for t in self.written if now - t <= window) / window, 1)
+        return sum(1 for t in list(ts)[-1024:] if now - t <= window) / window
+
+    def recent(self, window: float) -> float:
+        return round(self._rate(self.written, window), 1)
+
+    def base_fps(self, window: float = 1.0) -> float:
+        return self._rate(self.base_t, window)
+
+    def output_fps(self, window: float = 1.0) -> float:
+        return self._rate(self.present_t, window)
 
     def close(self):
         with self.cv:
             self.closed = True
             self.cv.notify()
         if self.proc and self.proc.poll() is None:
+            # Keep the stderr reader alive while mpv exits: with WAYLAND_DEBUG
+            # on, an undrained stderr pipe blocks mpv forever (orphan window).
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except Exception:
+                self.proc.kill()
             try:
                 self.proc.stdin.close()
             except OSError:
                 pass
-            self.proc.terminate()
 
 
-class KWinShowFps:
-    """Load KWin's showfps effect for the duration of the probe (restored after)."""
+class StopShortcut:
+    """Global shortcut (KWin script) that stops the probe over D-Bus.
 
-    def __init__(self):
+    The overlay is click-through and never takes keyboard focus, so it cannot
+    be closed with the mouse or a key press of its own."""
+
+    NAME = "dev.tweenglass.Probe"
+    PATH = "/dev/tweenglass/Probe"
+    SCRIPT = "tweenglass_probe_stop"
+    XML = f"""<node><interface name="{NAME}"><method name="Quit"/></interface></node>"""
+
+    def __init__(self, Gio, bus, on_quit, keys: str):
         import subprocess
-        self.sp = subprocess
-        self.qdbus = "qdbus6" if self._has("qdbus6") else "qdbus"
-        self.was_loaded = "showfps" in self._call("loadedEffects")
-        if not self.was_loaded:
-            self._call("loadEffect", "showfps")
-            print("[probe] KWin showfps effect loaded (compositor fps overlay)", flush=True)
+        self.sp, self.ok = subprocess, False
+        node = Gio.DBusNodeInfo.new_for_xml(self.XML)
 
-    def _has(self, exe):
-        from shutil import which
-        return which(exe) is not None
+        def call(_c, _s, _p, _i, method, _params, inv):
+            inv.return_value(None)
+            if method == "Quit":
+                on_quit()
 
-    def _call(self, method, *a):
-        r = self.sp.run([self.qdbus, "org.kde.KWin", "/Effects", f"org.kde.kwin.Effects.{method}", *a],
-                        capture_output=True, text=True)
-        return r.stdout
+        bus.register_object(self.PATH, node.interfaces[0], call, None, None)
+        Gio.bus_own_name_on_connection(bus, self.NAME, Gio.BusNameOwnerFlags.REPLACE, None, None)
+        js = (f'registerShortcut("TweenGlassProbeStop", "TweenGlass probe: stop", "{keys}", function() {{'
+              f' callDBus("{self.NAME}", "{self.PATH}", "{self.NAME}", "Quit"); }});')
+        path = STATE_DIR / "stop-shortcut.js"
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(js)
+        self._kwin("unloadScript", self.SCRIPT)
+        sid = self._kwin("loadScript", str(path), self.SCRIPT).strip()
+        if sid.lstrip("-").isdigit() and int(sid) >= 0:
+            self.sp.run(["qdbus6", "org.kde.KWin", f"/Scripting/Script{sid}", "org.kde.kwin.Script.run"],
+                        capture_output=True)
+            self.ok = True
+            print(f"[probe] press {keys} to stop", flush=True)
+
+    def _kwin(self, method, *a) -> str:
+        try:
+            return self.sp.run(["qdbus6", "org.kde.KWin", "/Scripting", f"org.kde.kwin.Scripting.{method}", *a],
+                               capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            return ""
 
     def close(self):
-        if not self.was_loaded and not getattr(self, "closed", False):
-            self.closed = True
-            self._call("unloadEffect", "showfps")
+        if self.ok:
+            self.ok = False
+            self._kwin("unloadScript", self.SCRIPT)
 
 
 # --------------------------------------------------------------------------
@@ -426,15 +545,17 @@ class KWinShowFps:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seconds", type=float, default=60, help="measurement time after the stream starts")
-    ap.add_argument("--sink", choices=["mpv", "vulkan", "none"], default="mpv",
-                    help="mpv: deduped frames piped to a fullscreen, resizable mpv (Vulkan) — default; "
+    ap.add_argument("--sink", choices=["overlay", "mpv", "vulkan", "none"], default="overlay",
+                    help="overlay: click-through fullscreen layer-shell overlay (GTK4/Vulkan) — default; "
+                         "mpv: fullscreen mpv window (Vulkan, takes clicks); "
                          "vulkan: GStreamer vulkansink (XWayland, fixed-size); none: measure only")
     ap.add_argument("--no-display", action="store_true", help="alias for --sink none")
     ap.add_argument("--canvas", type=lambda v: tuple(int(x) for x in v.lower().split("x")), default=None,
                     help="mpv input size WxH (default: largest active monitor mode)")
     ap.add_argument("--windowed", action="store_true", help="mpv: start windowed instead of fullscreen")
-    ap.add_argument("--kwin-fps", action="store_true",
-                    help="temporarily load KWin's 'showfps' effect (compositor fps = output fps of the overlay)")
+    ap.add_argument("--stop-keys", default="Meta+Alt+Q", help="global shortcut that stops the probe (KDE)")
+    ap.add_argument("--no-hud", action="store_true",
+                    help="hide the 'base / output' fps counter drawn in the top-left corner")
     ap.add_argument("--multiplier", type=int, default=2)
     ap.add_argument("--flow-scale", type=float, default=1.0)
     ap.add_argument("--performance", action="store_true")
@@ -470,25 +591,28 @@ def main() -> None:
         # Fixed canvas: the source window changes size (e.g. the browser going
         # fullscreen 1920x970 -> 1920x1080), but mpv's rawvideo input cannot.
         # Letterbox every frame into the canvas instead of dropping it.
+        "overlay": None,
         "mpv": ("videoconvert ! videoscale add-borders=true method=bilinear ! "
                 f"video/x-raw,format=BGRA,width={args.canvas[0]},height={args.canvas[1]},pixel-aspect-ratio=1/1 ! "
-                "appsink name=out emit-signals=true max-buffers=2 drop=true sync=false"),
-    }[args.sink]
+                f"{HUD} ! appsink name=out emit-signals=true max-buffers=2 drop=true sync=false"),
+    }
+    sink["overlay"] = sink["mpv"]
+    sink = sink[args.sink]
 
     cad = Cadence(Gst)
-    mpv = MpvSink(args, Gst) if args.sink == "mpv" else None
-    kwin_fps = KWinShowFps() if args.kwin_fps else None
+    mpv = MpvSink(args, Gst, cad) if args.sink in ("mpv", "overlay") else None
     loop = GLib.MainLoop()
 
-    # Always undo side effects (KWin fps overlay, mpv) even on SIGTERM/SIGHUP —
-    # otherwise the compositor fps counter stays on screen after the probe dies.
+    # Always close mpv, even on SIGTERM/SIGHUP.
     import atexit, signal
 
+    stopper = StopShortcut(Gio, portal.bus, loop.quit, args.stop_keys) if mpv else None
+
     def cleanup():
+        if stopper:
+            stopper.close()
         if mpv:
             mpv.close()
-        if kwin_fps:
-            kwin_fps.close()
     atexit.register(cleanup)
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, lambda *_: (loop.quit(), False)[1])
@@ -510,13 +634,16 @@ def main() -> None:
         # ignored and silently fall back to the default source (e.g. the webcam).
         serial = props.get("pipewire-serial")
         target = f"target-object={serial}" if serial is not None else f"path={node}"
+        keepalive = "keepalive-time=500 " if mpv else ""
         pipe = Gst.parse_launch(
-            f"pipewiresrc name=src fd={fd} {target} do-timestamp=true "
+            f"pipewiresrc name=src fd={fd} {target} do-timestamp=true {keepalive}"
             f"stream-properties=\"props,node.dont-fallback=(boolean)true,node.dont-reconnect=(boolean)true\" "
             f"! video/x-raw ! queue max-size-buffers=2 leaky=downstream ! {sink}")
         pipe.get_by_name("src").get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, cad.probe)
         if mpv:
             pipe.get_by_name("out").connect("new-sample", mpv.on_sample)
+            state["hud"] = pipe.get_by_name("hud")
+            state["hud"].set_property("silent", args.no_hud)
         bus = pipe.get_bus()
         bus.add_signal_watch()
         bus.connect("message", on_msg)
@@ -582,16 +709,28 @@ def main() -> None:
 
     def progress():
         d, u = cad.recent(5.0)
-        extra = f" presented_to_mpv={mpv.recent(5.0)}" if mpv else ""
+        extra = (f" base={mpv.base_fps(5.0):.1f}fps output={mpv.output_fps(5.0):.1f}fps"
+                 f" (written_to_mpv={mpv.recent(5.0)})") if mpv and mpv.proc else ""
         print(f"[probe] t+{time.monotonic() - t0:.0f}s last5s: delivered={d}fps unique={u}fps{extra} "
               f"dups_total={cad.dups} reconnects={state['restarts']}", flush=True)
         if mpv and mpv.proc and mpv.proc.poll() is not None:
-            print("[probe] mpv closed — stopping", flush=True)
+            print("[probe] presenter closed — stopping", flush=True)
             loop.quit()
             return False
         return True
 
     GLib.timeout_add_seconds(5, progress)
+
+    def hud_tick():
+        if mpv and mpv.proc:
+            text = f"{mpv.base_fps():.0f} / {mpv.output_fps():.0f}"
+            mpv.hud_text = text
+            if state.get("hud") is not None:
+                state["hud"].set_property("text", text)
+        return True
+
+    if mpv:
+        GLib.timeout_add(500, hud_tick)
     try:
         loop.run()
     except KeyboardInterrupt:

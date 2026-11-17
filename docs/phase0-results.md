@@ -55,3 +55,42 @@ stream" on KWin until upstream is fixed; worth an upstream KWin bug report.
 The KWin `showfps` overlay is now unloaded on every exit path (normal end,
 mpv closed, SIGINT/SIGTERM/SIGHUP); before it stayed on screen when the probe
 was killed.
+
+## 2026-11-17 — Real output fps and click-through overlay
+
+**KWin `showfps` is not a valid metric.** The effect repaints the whole screen
+on every vblank, so it always reads the refresh rate (120/120 here),
+whatever the overlay presents. Removed from the probe.
+
+**Real output fps** = buffers the presenter process attaches to its
+`wl_surface` (`WAYLAND_DEBUG=client`, `-> wl_surface#N.attach(`). lsfg-vk's
+generated frames go through the same WSI, so they are counted. Validated
+with a 30 fps source:
+
+| Presenter | lsfg off | x2 | x3 | x4 |
+|---|---|---|---|---|
+| mpv window (720p) | 30 | 60 | — | 120 |
+| GTK4 overlay, default frame clock | 30 | ~52 | ~71 | ~93 |
+| GTK4 overlay, `GDK_DEBUG=no-vsync` | 30 | **60** | **90** | 111 |
+
+x4 of 30 fps on a 120 Hz output leaves no headroom, so about 1 base frame/s
+is dropped.
+
+**Click-through overlay** (`tools/phase0/overlay.py`): GTK4 + gtk4-layer-shell
+(layer OVERLAY, anchored to all edges, exclusive zone -1, keyboard NONE) with
+an empty `wl_surface.set_input_region`. GSK Vulkan renderer, so lsfg-vk hooks
+it. Pitfalls:
+- gtk4-layer-shell must be loaded before libwayland → re-exec with
+  `LD_PRELOAD=libgtk4-layer-shell.so`.
+- GTK always picks Vulkan device 0 (the Intel iGPU here; lsfg ran at ~5 fps
+  there) and ignores `__NV_PRIME_RENDER_OFFLOAD` and `GDK_VULKAN_DEVICE` →
+  `MESA_VK_DEVICE_SELECT=10de:25ec!`.
+- GTK's frame clock merges frames once lsfg adds its own presents → `GDK_DEBUG=no-vsync`
+  (we only queue a redraw per new frame, so it costs nothing).
+- A layer-shell overlay is above fullscreen windows. An mpv/xdg_toplevel
+  window drops below the source as soon as the user clicks a fullscreen
+  source (KWin's active fullscreen layer).
+
+The HUD (`base / output`) is burned into the frames with GStreamer
+`textoverlay`, so it adds no presents. `keepalive-time` keeps it updating
+while the source is static (paused video shows `0 / 0`).
